@@ -162,7 +162,6 @@ const HTML = `<!DOCTYPE html>
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee;';
       
-      // ==================== 只改了这里（避免嵌套模板字符串） ====================
       let html = '<div><strong>' + acc.email + '</strong>';
       if (isGrabbed) {
         html += '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>';
@@ -264,7 +263,8 @@ const HTML = `<!DOCTYPE html>
   function addLog(text) {
     const log = document.getElementById('log');
     const time = new Date().toLocaleTimeString();
-    log.innerHTML = `<div class="log-item">[${time}] ${text}</div>` + log.innerHTML;
+    // ==================== 只改了这一行 ====================
+    log.innerHTML = '<div class="log-item">[' + time + '] ' + text + '</div>' + log.innerHTML;
   }
 
   function updateScanCount() {
