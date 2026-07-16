@@ -325,6 +325,7 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
+  // ==================== 已修复的 pollOnce ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -354,24 +355,32 @@ const HTML = `<!DOCTYPE html>
       totalScanned++;
       updateScanCount();
 
-      if (numRes.code !== 200 || !numRes.data?.phoneNumber) {
-        addLog('获取号码失败');
+      if (numRes.code !== 200 || !Array.isArray(numRes.data) || numRes.data.length === 0) {
+        addLog('获取号码失败（返回为空或格式不对）');
         return;
       }
 
-      const phone = numRes.data.phoneNumber;
-      const last4 = phone.slice(-4);
       const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
-      const matched = patterns.some(p => last4 === p);
 
-      if (!matched) {
-        addLog(\`共扫到 \${totalScanned} 个 | \${phone} 不匹配，跳过\`);
+      // 遍历返回的号码列表，找匹配的
+      let matchedPhone = null;
+      for (const item of numRes.data) {
+        if (!item.phoneNumber) continue;
+        const last4 = item.phoneNumber.slice(-4);
+        if (patterns.some(p => last4 === p)) {
+          matchedPhone = item.phoneNumber;
+          break;
+        }
+      }
+
+      if (!matchedPhone) {
+        addLog(\`共扫到 \${totalScanned} 个 | 本次无匹配尾号，跳过\`);
         return;
       }
 
-      addLog(\`发现匹配号码 \${phone}，开始自动购买...\`);
+      addLog(\`发现匹配号码 \${matchedPhone}，开始自动购买...\`);
 
-      const buyRes = await buyNumber(phone, acc.token);
+      const buyRes = await buyNumber(matchedPhone, acc.token);
 
       let resultText = '';
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
@@ -379,13 +388,13 @@ const HTML = `<!DOCTYPE html>
         if (payRes.code === 200) {
           resultText = '购买成功';
         } else {
-          resultText = '付款失败（余额不足或其他）→ 已记录为成功';
+          resultText = \`付款失败（\${payRes.message || '余额不足或其他'}）→ 已记录为成功\`;
         }
       } else {
-        resultText = '占号失败 → 已记录为成功';
+        resultText = \`占号失败（\${buyRes.message || '未知'}）→ 已记录为成功\`;
       }
 
-      addLog(\`发现匹配号码 \${phone} 结果：\${resultText}\`);
+      addLog(\`发现匹配号码 \${matchedPhone} 结果：\${resultText}\`);
 
       grabbedAccounts.push(acc.email);
       saveGrabbed();
@@ -396,6 +405,7 @@ const HTML = `<!DOCTYPE html>
       addLog('出错: ' + e.message);
     }
   }
+  // ==================== 修复结束 ====================
 
   function startGrab() {
     if (grabInterval) clearInterval(grabInterval);
