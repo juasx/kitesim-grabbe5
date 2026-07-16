@@ -263,12 +263,12 @@ const HTML = `<!DOCTYPE html>
   function addLog(text) {
     const log = document.getElementById('log');
     const time = new Date().toLocaleTimeString();
-    // ==================== 只改了这一行 ====================
     log.innerHTML = '<div class="log-item">[' + time + '] ' + text + '</div>' + log.innerHTML;
   }
 
   function updateScanCount() {
-    document.getElementById('scanCount').textContent = `共轮询 ${totalScanned} 次`;
+    // ==================== 只改了这一行 ====================
+    document.getElementById('scanCount').textContent = '共轮询 ' + totalScanned + ' 次';
   }
 
   function clearLog() {
@@ -393,20 +393,20 @@ const HTML = `<!DOCTYPE html>
       }
 
       if (!matchedPhone) {
-        addLog(`共轮询 ${totalScanned} 次 | 本次无符合条件的号码，跳过`);
+        addLog('共轮询 ' + totalScanned + ' 次 | 本次无符合条件的号码，跳过');
         return;
       }
 
-      addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始购买...`);
+      addLog('发现 ' + matchedClass + '类 号码 ' + matchedPhone + '（0.3季包），开始购买...');
 
       const buyRes = await buyNumber(matchedPhone, acc.token);
 
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
-        addLog(`占号接口返回成功，正在校验未支付列表...`);
+        addLog('占号接口返回成功，正在校验未支付列表...');
         const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
 
         if (isInUnpaid) {
-          addLog(`【占号成功并已校验】${matchedClass}类 号码 ${matchedPhone}（未支付列表已出现）`);
+          addLog('【占号成功并已校验】' + matchedClass + '类 号码 ' + matchedPhone + '（未支付列表已出现）');
           try {
             await confirmPay(buyRes.data.orderNo, acc.token);
           } catch (e) {}
@@ -415,10 +415,10 @@ const HTML = `<!DOCTYPE html>
           renderAccounts();
           stopGrab();
         } else {
-          addLog(`【占号后校验失败】${matchedPhone} 未在未支付列表中出现，暂不锁定`);
+          addLog('【占号后校验失败】' + matchedPhone + ' 未在未支付列表中出现，暂不锁定');
         }
       } else {
-        addLog(`【占号失败】${matchedClass}类 号码 ${matchedPhone} | ${buyRes.message || 'Server Exception'}`);
+        addLog('【占号失败】' + matchedClass + '类 号码 ' + matchedPhone + ' | ' + (buyRes.message || 'Server Exception'));
       }
 
     } catch (e) {
@@ -448,15 +448,14 @@ const HTML = `<!DOCTYPE html>
     }
     const list = seenNumbersList.join('\n');
     const win = window.open('', '_blank');
-    win.document.write(`
-      <html>
-        <head><title>已扫到的号码（共 ${seenNumbersList.length} 个）</title></head>
-        <body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">
-          <h3>已扫到的唯一号码（共 ${seenNumbersList.length} 个）</h3>
-          ${list}
-        </body>
-      </html>
-    `);
+    // ==================== 这里也改成字符串拼接避免问题 ====================
+    win.document.write(
+      '<html><head><title>已扫到的号码（共 ' + seenNumbersList.length + ' 个）</title></head>' +
+      '<body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">' +
+      '<h3>已扫到的唯一号码（共 ' + seenNumbersList.length + ' 个）</h3>' +
+      list +
+      '</body></html>'
+    );
   }
 
   function init() {
