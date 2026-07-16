@@ -77,13 +77,11 @@ const HTML = `<!DOCTYPE html>
         <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goAddAccount()">添加账号</button>
       </div>
 
-      <!-- 账号列表 -->
       <div class="card">
         <h3 style="margin:0 0 12px 0;">已添加账号</h3>
         <div id="accountList"></div>
       </div>
 
-      <!-- 抢号设置 -->
       <div class="card">
         <h3 style="margin:0 0 12px 0;">抢号设置</h3>
         <div>
@@ -91,8 +89,8 @@ const HTML = `<!DOCTYPE html>
           <select id="selectedAccount"></select>
         </div>
         <div style="margin-top:12px;">
-          <label>尾号匹配（逗号分隔）</label>
-          <input id="patterns" value="aaab,abbb,aaaa">
+          <label>分类匹配（格式：aaab:1110 3331 8883, abbb:1000）</label>
+          <input id="patterns" value="aaab:1110 3331 8883, abbb:1000, aaaa:1111">
         </div>
         <div style="margin-top:16px; display:flex; gap:10px;">
           <button class="btn" onclick="startGrab()">开始抢号（每10秒）</button>
@@ -101,7 +99,6 @@ const HTML = `<!DOCTYPE html>
         <div id="grabStatus" style="margin-top:12px;"></div>
       </div>
 
-      <!-- 日志 -->
       <div class="card">
         <h3 style="margin:0 0 8px 0;">抢号日志 <span id="scanCount" style="font-size:13px;color:#666;"></span></h3>
         <div id="log" class="log"></div>
@@ -109,7 +106,7 @@ const HTML = `<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- 添加账号页（登录页） -->
+    <!-- 添加账号页 -->
     <div class="page" id="pageAddAccount">
       <div class="nav">
         <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goMain()">返回</button>
@@ -164,7 +161,6 @@ const HTML = `<!DOCTYPE html>
       container.innerHTML = '<div style="color:#888;">还没有账号，点击右上角“添加账号”</div>';
       return;
     }
-
     accounts.forEach((acc, index) => {
       const isGrabbed = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
@@ -181,7 +177,6 @@ const HTML = `<!DOCTYPE html>
       \`;
       container.appendChild(div);
     });
-
     updateAccountSelect();
   }
 
@@ -242,9 +237,7 @@ const HTML = `<!DOCTYPE html>
         saveAccounts();
         msg.textContent = '添加成功！';
         msg.style.color = '#34c759';
-        setTimeout(() => {
-          goMain();
-        }, 600);
+        setTimeout(() => goMain(), 600);
       } else {
         msg.textContent = json.message || '登录失败';
         msg.style.color = '#c8102e';
@@ -271,7 +264,7 @@ const HTML = `<!DOCTYPE html>
     grabbedAccounts = grabbedAccounts.filter(e => e !== email);
     saveGrabbed();
     renderAccounts();
-    alert('已重置，可再次抢号');
+    alert('已重置');
   }
 
   function addLog(text) {
@@ -281,7 +274,7 @@ const HTML = `<!DOCTYPE html>
   }
 
   function updateScanCount() {
-    document.getElementById('scanCount').textContent = \`共扫到 \${totalScanned} 个\`;
+    document.getElementById('scanCount').textContent = \`共轮询 \${totalScanned} 次\`;
   }
 
   function clearLog() {
@@ -325,7 +318,7 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 已修复的 pollOnce ====================
+  // ==================== 支持分类多尾号匹配 ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -356,25 +349,44 @@ const HTML = `<!DOCTYPE html>
       updateScanCount();
 
       if (numRes.code !== 200 || !Array.isArray(numRes.data) || numRes.data.length === 0) {
-        addLog('获取号码失败（返回为空或格式不对）');
+        addLog('获取号码失败');
         return;
       }
 
-      const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
+      // 解析 aaab:1110 3331 8883 格式
+      const rawPatterns = document.getElementById('patterns').value.split(',');
+      const patternGroups = {}; // { aaab: ['1110','3331','8883'], ... }
 
-      // 遍历返回的号码列表，找匹配的
+      rawPatterns.forEach(item => {
+        const trimmed = item.trim();
+        if (!trimmed) return;
+        const [className, ...tails] = trimmed.split(/[:\s]+/);
+        if (className && tails.length > 0) {
+          patternGroups[className] = tails;
+        }
+      });
+
       let matchedPhone = null;
+      let matchedClass = '';
+      let matchedTail = '';
+
       for (const item of numRes.data) {
         if (!item.phoneNumber) continue;
         const last4 = item.phoneNumber.slice(-4);
-        if (patterns.some(p => last4 === p)) {
-          matchedPhone = item.phoneNumber;
-          break;
+
+        for (const [className, tails] of Object.entries(patternGroups)) {
+          if (tails.includes(last4)) {
+            matchedPhone = item.phoneNumber;
+            matchedClass = className;
+            matchedTail = last4;
+            break;
+          }
         }
+        if (matchedPhone) break;
       }
 
       if (!matchedPhone) {
-        addLog(\`共扫到 \${totalScanned} 个 | 本次无匹配尾号，跳过\`);
+        addLog(\`共轮询 \${totalScanned} 次 | 本次无匹配尾号，跳过\`);
         return;
       }
 
@@ -385,16 +397,12 @@ const HTML = `<!DOCTYPE html>
       let resultText = '';
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
         const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
-        if (payRes.code === 200) {
-          resultText = '购买成功';
-        } else {
-          resultText = \`付款失败（\${payRes.message || '余额不足或其他'}）→ 已记录为成功\`;
-        }
+        resultText = payRes.code === 200 ? '购买成功' : \`付款失败（\${payRes.message || '余额不足'}）→ 已记录为成功\`;
       } else {
         resultText = \`占号失败（\${buyRes.message || '未知'}）→ 已记录为成功\`;
       }
 
-      addLog(\`发现匹配号码 \${matchedPhone} 结果：\${resultText}\`);
+      addLog(\`发现匹配号码 \${matchedPhone} 结果：\${matchedClass}类 (匹配到 \${matchedTail}) | \${resultText}\`);
 
       grabbedAccounts.push(acc.email);
       saveGrabbed();
@@ -405,7 +413,6 @@ const HTML = `<!DOCTYPE html>
       addLog('出错: ' + e.message);
     }
   }
-  // ==================== 修复结束 ====================
 
   function startGrab() {
     if (grabInterval) clearInterval(grabInterval);
