@@ -121,324 +121,329 @@ const HTML = `<!DOCTYPE html>
   </div>
 
 <script>
-  let accounts = JSON.parse(localStorage.getItem('grabber_accounts') || '[]');
-  let grabbedAccounts = JSON.parse(localStorage.getItem('grabbed_accounts') || '[]');
-  let grabInterval = null;
-  let totalScanned = 0;
-  let seenNumbers = new Set();
-  let seenNumbersList = [];
-  let captchaKey = '';
+// ==================== 函数提前定义 ====================
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
 
-  function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
-  function saveGrabbed() { localStorage.setItem('grabbed_accounts', JSON.stringify(grabbedAccounts)); }
+function goAddAccount() {
+  console.log('goAddAccount 被调用了'); // 调试用
+  showPage('pageAddAccount');
+  loadCaptcha();
+  const msg = document.getElementById('loginMsg');
+  if (msg) msg.textContent = '';
+}
 
-  function showPage(id) {
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    document.getElementById(id).classList.add('active');
+function goMain() {
+  showPage('pageMain');
+  renderAccounts();
+}
+
+// ==================== 其他代码 ====================
+let accounts = JSON.parse(localStorage.getItem('grabber_accounts') || '[]');
+let grabbedAccounts = JSON.parse(localStorage.getItem('grabbed_accounts') || '[]');
+let grabInterval = null;
+let totalScanned = 0;
+let seenNumbers = new Set();
+let seenNumbersList = [];
+let captchaKey = '';
+
+function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
+function saveGrabbed() { localStorage.setItem('grabbed_accounts', JSON.stringify(grabbedAccounts)); }
+
+function addLog(text) {
+  const log = document.getElementById('log');
+  const time = new Date().toLocaleTimeString();
+  log.innerHTML = '<div>[' + time + '] ' + text + '</div>' + log.innerHTML;
+}
+
+function updateScanCount() {
+  document.getElementById('scanCount').textContent = totalScanned;
+}
+
+function renderAccounts() {
+  const container = document.getElementById('accountList');
+  container.innerHTML = '';
+  if (accounts.length === 0) {
+    container.innerHTML = '<div style="color:#888;">还没有账号，点击右上角“添加账号”</div>';
+    return;
   }
+  accounts.forEach((acc, i) => {
+    const isLocked = grabbedAccounts.includes(acc.email);
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee;';
+    div.innerHTML = '<div><strong>' + acc.email + '</strong> ' + (isLocked ? '<span style="color:#c8102e">[已锁定]</span>' : '') + '</div>' +
+      '<div><button onclick="resetAccount(' + i + ')">重置</button><button onclick="removeAccount(' + i + ')" style="color:#c8102e">删除</button></div>';
+    container.appendChild(div);
+  });
+  updateAccountSelect();
+}
 
-  function goMain() {
-    showPage('pageMain');
-    renderAccounts();
-  }
-
-  function goAddAccount() {
-    showPage('pageAddAccount');
-    loadCaptcha();
-    document.getElementById('loginMsg').textContent = '';
-  }
-
-  function addLog(text) {
-    const log = document.getElementById('log');
-    const time = new Date().toLocaleTimeString();
-    log.innerHTML = '<div>[' + time + '] ' + text + '</div>' + log.innerHTML;
-  }
-
-  function updateScanCount() {
-    document.getElementById('scanCount').textContent = totalScanned;
-  }
-
-  function renderAccounts() {
-    const container = document.getElementById('accountList');
-    container.innerHTML = '';
-    if (accounts.length === 0) {
-      container.innerHTML = '<div style="color:#888;">还没有账号，点击右上角“添加账号”</div>';
-      return;
+function updateAccountSelect() {
+  const select = document.getElementById('selectedAccount');
+  select.innerHTML = '';
+  accounts.forEach((acc, i) => {
+    if (!grabbedAccounts.includes(acc.email)) {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = acc.email;
+      select.appendChild(opt);
     }
-    accounts.forEach((acc, i) => {
-      const isLocked = grabbedAccounts.includes(acc.email);
-      const div = document.createElement('div');
-      div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee;';
-      div.innerHTML = '<div><strong>' + acc.email + '</strong> ' + (isLocked ? '<span style="color:#c8102e">[已锁定]</span>' : '') + '</div>' +
-        '<div><button onclick="resetAccount(' + i + ')">重置</button><button onclick="removeAccount(' + i + ')" style="color:#c8102e">删除</button></div>';
-      container.appendChild(div);
+  });
+}
+
+function removeAccount(i) {
+  if (!confirm('确定删除？')) return;
+  const email = accounts[i].email;
+  accounts.splice(i, 1);
+  grabbedAccounts = grabbedAccounts.filter(e => e !== email);
+  saveAccounts();
+  saveGrabbed();
+  renderAccounts();
+}
+
+function resetAccount(i) {
+  const email = accounts[i].email;
+  grabbedAccounts = grabbedAccounts.filter(e => e !== email);
+  saveGrabbed();
+  renderAccounts();
+  alert('已重置');
+}
+
+function clearLog() {
+  document.getElementById('log').innerHTML = '';
+  totalScanned = 0;
+  updateScanCount();
+}
+
+function showSeenNumbers() {
+  if (seenNumbersList.length === 0) {
+    alert('还没有扫到号码');
+    return;
+  }
+  const w = window.open('', '_blank');
+  w.document.write('<pre>已扫到 ' + seenNumbersList.length + ' 个唯一号码：\n\n' + seenNumbersList.join('\n') + '</pre>');
+}
+
+async function loadCaptcha() {
+  try {
+    const res = await fetch('/api/index/captcha-image-base64');
+    const json = await res.json();
+    if (json.captchaKey) {
+      captchaKey = json.captchaKey;
+      document.getElementById('captchaImg').src = 'data:image/png;base64,' + json.captchaImageBase64;
+    }
+  } catch (e) {}
+}
+
+async function doLogin() {
+  const email = document.getElementById('email').value.trim();
+  const pass = document.getElementById('pass').value;
+  const code = document.getElementById('captchaCode').value.trim();
+  const msg = document.getElementById('loginMsg');
+
+  if (!email || !pass || !code) {
+    msg.textContent = '请填写完整';
+    msg.style.color = '#c8102e';
+    return;
+  }
+
+  msg.textContent = '登录中...';
+  msg.style.color = '#333';
+
+  try {
+    const res = await fetch('/api/index/sign-in', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, pass, captchaCode: code, captchaKey })
     });
-    updateAccountSelect();
-  }
+    const json = await res.json();
 
-  function updateAccountSelect() {
-    const select = document.getElementById('selectedAccount');
-    select.innerHTML = '';
-    accounts.forEach((acc, i) => {
-      if (!grabbedAccounts.includes(acc.email)) {
-        const opt = document.createElement('option');
-        opt.value = i;
-        opt.textContent = acc.email;
-        select.appendChild(opt);
-      }
-    });
-  }
-
-  function removeAccount(i) {
-    if (!confirm('确定删除？')) return;
-    const email = accounts[i].email;
-    accounts.splice(i, 1);
-    grabbedAccounts = grabbedAccounts.filter(e => e !== email);
-    saveAccounts();
-    saveGrabbed();
-    renderAccounts();
-  }
-
-  function resetAccount(i) {
-    const email = accounts[i].email;
-    grabbedAccounts = grabbedAccounts.filter(e => e !== email);
-    saveGrabbed();
-    renderAccounts();
-    alert('已重置');
-  }
-
-  function clearLog() {
-    document.getElementById('log').innerHTML = '';
-    totalScanned = 0;
-    updateScanCount();
-  }
-
-  function showSeenNumbers() {
-    if (seenNumbersList.length === 0) {
-      alert('还没有扫到号码');
-      return;
-    }
-    const w = window.open('', '_blank');
-    w.document.write('<pre>已扫到 ' + seenNumbersList.length + ' 个唯一号码：\n\n' + seenNumbersList.join('\n') + '</pre>');
-  }
-
-  async function loadCaptcha() {
-    try {
-      const res = await fetch('/api/index/captcha-image-base64');
-      const json = await res.json();
-      if (json.captchaKey) {
-        captchaKey = json.captchaKey;
-        document.getElementById('captchaImg').src = 'data:image/png;base64,' + json.captchaImageBase64;
-      }
-    } catch (e) {}
-  }
-
-  async function doLogin() {
-    const email = document.getElementById('email').value.trim();
-    const pass = document.getElementById('pass').value;
-    const code = document.getElementById('captchaCode').value.trim();
-    const msg = document.getElementById('loginMsg');
-
-    if (!email || !pass || !code) {
-      msg.textContent = '请填写完整';
-      msg.style.color = '#c8102e';
-      return;
-    }
-
-    msg.textContent = '登录中...';
-    msg.style.color = '#333';
-
-    try {
-      const res = await fetch('/api/index/sign-in', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, pass, captchaCode: code, captchaKey })
-      });
-      const json = await res.json();
-
-      if (json.code === 200 && json.data) {
-        if (accounts.some(a => a.email === email)) {
-          msg.textContent = '该账号已存在';
-          msg.style.color = '#c8102e';
-          return;
-        }
-        accounts.push({ email, token: json.data });
-        saveAccounts();
-        msg.textContent = '添加成功！';
-        msg.style.color = '#34c759';
-        setTimeout(() => {
-          goMain();
-        }, 600);
-      } else {
-        msg.textContent = json.message || '登录失败';
+    if (json.code === 200 && json.data) {
+      if (accounts.some(a => a.email === email)) {
+        msg.textContent = '该账号已存在';
         msg.style.color = '#c8102e';
-        loadCaptcha();
-      }
-    } catch (e) {
-      msg.textContent = '网络错误';
-      msg.style.color = '#c8102e';
-    }
-  }
-
-  function matchesPattern(last4, pattern) {
-    if (!last4 || last4.length !== 4) return false;
-    const [a, b, c, d] = last4.split('');
-    if (pattern === 'aaaa') return a === b && b === c && c === d;
-    if (pattern === 'aaab') return a === b && b === c && c !== d;
-    if (pattern === 'abbb') return a !== b && b === c && c === d;
-    if (pattern === 'abab') return a === c && b === d && a !== b;
-    if (pattern === 'abba') return a === d && b === c && a !== b;
-    return false;
-  }
-
-  async function checkHasPaidNumber(token) {
-    try {
-      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', { headers: { token } });
-      const json = await res.json();
-      return json.data?.records?.length > 0;
-    } catch { return false; }
-  }
-
-  async function checkUnpaidNumber(phone, token) {
-    try {
-      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=20&status=2&phone=', { headers: { token } });
-      const json = await res.json();
-      if (json.code === 200 && json.data?.records) {
-        return json.data.records.some(r => r.phoneNumber === phone);
-      }
-      return false;
-    } catch { return false; }
-  }
-
-  async function getNewNumber(token) {
-    const res = await fetch('/api/countryCode/getPhoneNumber/CA', { headers: { token } });
-    return await res.json();
-  }
-
-  async function buyNumber(phone, token) {
-    try {
-      const res = await fetch('/api/userPhonePurchase/buyPhoneNumberOrder', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', token },
-        body: JSON.stringify({ phoneNumber: phone, countryCode: 'CA' })
-      });
-      return await res.json();
-    } catch (e) { return { code: 0, message: e.message }; }
-  }
-
-  async function confirmPay(orderNo, token) {
-    try {
-      const res = await fetch('/api/userPhonePurchase/confirmPay', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', token },
-        body: JSON.stringify({ orderNo })
-      });
-      return await res.json();
-    } catch (e) { return { code: 0, message: e.message }; }
-  }
-
-  async function pollOnce() {
-    const select = document.getElementById('selectedAccount');
-    if (!select.value) return;
-    const acc = accounts[parseInt(select.value)];
-    if (!acc || grabbedAccounts.includes(acc.email)) return;
-
-    const hasPaid = await checkHasPaidNumber(acc.token);
-    if (hasPaid) {
-      grabbedAccounts.push(acc.email);
-      saveGrabbed();
-      renderAccounts();
-      stopGrab();
-      return;
-    }
-
-    try {
-      const numRes = await getNewNumber(acc.token);
-      totalScanned++;
-      updateScanCount();
-
-      if (numRes.code !== 200 || !numRes.data?.length) return;
-
-      numRes.data.forEach(item => {
-        if (item.phoneNumber && !seenNumbers.has(item.phoneNumber)) {
-          seenNumbers.add(item.phoneNumber);
-          seenNumbersList.push(item.phoneNumber);
-        }
-      });
-
-      const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
-      let matchedPhone = null;
-      let matchedClass = '';
-
-      for (const item of numRes.data) {
-        if (item.buyPrice !== 0.30) continue;
-        const last4 = item.phoneNumber.slice(-4);
-        for (const pat of patterns) {
-          if (matchesPattern(last4, pat)) {
-            matchedPhone = item.phoneNumber;
-            matchedClass = pat;
-            break;
-          }
-        }
-        if (matchedPhone) break;
-      }
-
-      if (!matchedPhone) {
-        addLog('共轮询 ' + totalScanned + ' 次 | 无符合号码');
         return;
       }
-
-      addLog('发现 ' + matchedClass + '类 号码 ' + matchedPhone + '，开始占号...');
-
-      const buyRes = await buyNumber(matchedPhone, acc.token);
-
-      if (buyRes.code === 200 && buyRes.data?.orderNo) {
-        addLog('占号接口返回成功，正在校验未支付列表...');
-        const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
-
-        if (isInUnpaid) {
-          addLog('【占号成功并已校验】' + matchedClass + '类 号码 ' + matchedPhone);
-
-          try {
-            await confirmPay(buyRes.data.orderNo, acc.token);
-          } catch (e) {}
-
-          grabbedAccounts.push(acc.email);
-          saveGrabbed();
-          renderAccounts();
-          stopGrab();
-        } else {
-          addLog('【占号后校验失败】' + matchedPhone + ' 未在未支付列表中出现');
-        }
-      } else {
-        addLog('【占号失败】' + matchedClass + '类 号码 ' + matchedPhone + ' | ' + (buyRes.message || 'Server Exception'));
-      }
-
-    } catch (e) {
-      addLog('出错: ' + e.message);
+      accounts.push({ email, token: json.data });
+      saveAccounts();
+      msg.textContent = '添加成功！';
+      msg.style.color = '#34c759';
+      setTimeout(() => {
+        goMain();
+      }, 600);
+    } else {
+      msg.textContent = json.message || '登录失败';
+      msg.style.color = '#c8102e';
+      loadCaptcha();
     }
+  } catch (e) {
+    msg.textContent = '网络错误';
+    msg.style.color = '#c8102e';
   }
+}
 
-  function startGrab() {
-    if (grabInterval) clearInterval(grabInterval);
-    const select = document.getElementById('selectedAccount');
-    if (!select.value) { alert('请选择账号'); return; }
-    document.getElementById('grabStatus').innerHTML = '<span class="status running">正在抢号中...</span>';
-    pollOnce();
-    grabInterval = setInterval(pollOnce, 10000);
-  }
+// 其他抢号相关函数保持不变（和之前一样）
+function matchesPattern(last4, pattern) {
+  if (!last4 || last4.length !== 4) return false;
+  const [a, b, c, d] = last4.split('');
+  if (pattern === 'aaaa') return a === b && b === c && c === d;
+  if (pattern === 'aaab') return a === b && b === c && c !== d;
+  if (pattern === 'abbb') return a !== b && b === c && c === d;
+  if (pattern === 'abab') return a === c && b === d && a !== b;
+  if (pattern === 'abba') return a === d && b === c && a !== b;
+  return false;
+}
 
-  function stopGrab() {
-    if (grabInterval) clearInterval(grabInterval);
-    grabInterval = null;
-    document.getElementById('grabStatus').innerHTML = '<span class="status stopped">已停止</span>';
-  }
+async function checkHasPaidNumber(token) {
+  try {
+    const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', { headers: { token } });
+    const json = await res.json();
+    return json.data?.records?.length > 0;
+  } catch { return false; }
+}
 
-  function init() {
+async function checkUnpaidNumber(phone, token) {
+  try {
+    const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=20&status=2&phone=', { headers: { token } });
+    const json = await res.json();
+    if (json.code === 200 && json.data?.records) {
+      return json.data.records.some(r => r.phoneNumber === phone);
+    }
+    return false;
+  } catch { return false; }
+}
+
+async function getNewNumber(token) {
+  const res = await fetch('/api/countryCode/getPhoneNumber/CA', { headers: { token } });
+  return await res.json();
+}
+
+async function buyNumber(phone, token) {
+  try {
+    const res = await fetch('/api/userPhonePurchase/buyPhoneNumberOrder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', token },
+      body: JSON.stringify({ phoneNumber: phone, countryCode: 'CA' })
+    });
+    return await res.json();
+  } catch (e) { return { code: 0, message: e.message }; }
+}
+
+async function confirmPay(orderNo, token) {
+  try {
+    const res = await fetch('/api/userPhonePurchase/confirmPay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', token },
+      body: JSON.stringify({ orderNo })
+    });
+    return await res.json();
+  } catch (e) { return { code: 0, message: e.message }; }
+}
+
+async function pollOnce() {
+  const select = document.getElementById('selectedAccount');
+  if (!select.value) return;
+  const acc = accounts[parseInt(select.value)];
+  if (!acc || grabbedAccounts.includes(acc.email)) return;
+
+  const hasPaid = await checkHasPaidNumber(acc.token);
+  if (hasPaid) {
+    grabbedAccounts.push(acc.email);
+    saveGrabbed();
     renderAccounts();
-    updateScanCount();
+    stopGrab();
+    return;
   }
-  init();
+
+  try {
+    const numRes = await getNewNumber(acc.token);
+    totalScanned++;
+    updateScanCount();
+
+    if (numRes.code !== 200 || !numRes.data?.length) return;
+
+    numRes.data.forEach(item => {
+      if (item.phoneNumber && !seenNumbers.has(item.phoneNumber)) {
+        seenNumbers.add(item.phoneNumber);
+        seenNumbersList.push(item.phoneNumber);
+      }
+    });
+
+    const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
+    let matchedPhone = null;
+    let matchedClass = '';
+
+    for (const item of numRes.data) {
+      if (item.buyPrice !== 0.30) continue;
+      const last4 = item.phoneNumber.slice(-4);
+      for (const pat of patterns) {
+        if (matchesPattern(last4, pat)) {
+          matchedPhone = item.phoneNumber;
+          matchedClass = pat;
+          break;
+        }
+      }
+      if (matchedPhone) break;
+    }
+
+    if (!matchedPhone) {
+      addLog('共轮询 ' + totalScanned + ' 次 | 无符合号码');
+      return;
+    }
+
+    addLog('发现 ' + matchedClass + '类 号码 ' + matchedPhone + '，开始占号...');
+
+    const buyRes = await buyNumber(matchedPhone, acc.token);
+
+    if (buyRes.code === 200 && buyRes.data?.orderNo) {
+      addLog('占号接口返回成功，正在校验未支付列表...');
+      const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
+
+      if (isInUnpaid) {
+        addLog('【占号成功并已校验】' + matchedClass + '类 号码 ' + matchedPhone);
+
+        try {
+          await confirmPay(buyRes.data.orderNo, acc.token);
+        } catch (e) {}
+
+        grabbedAccounts.push(acc.email);
+        saveGrabbed();
+        renderAccounts();
+        stopGrab();
+      } else {
+        addLog('【占号后校验失败】' + matchedPhone + ' 未在未支付列表中出现');
+      }
+    } else {
+      addLog('【占号失败】' + matchedClass + '类 号码 ' + matchedPhone + ' | ' + (buyRes.message || 'Server Exception'));
+    }
+
+  } catch (e) {
+    addLog('出错: ' + e.message);
+  }
+}
+
+function startGrab() {
+  if (grabInterval) clearInterval(grabInterval);
+  const select = document.getElementById('selectedAccount');
+  if (!select.value) { alert('请选择账号'); return; }
+  document.getElementById('grabStatus').innerHTML = '<span class="status running">正在抢号中...</span>';
+  pollOnce();
+  grabInterval = setInterval(pollOnce, 10000);
+}
+
+function stopGrab() {
+  if (grabInterval) clearInterval(grabInterval);
+  grabInterval = null;
+  document.getElementById('grabStatus').innerHTML = '<span class="status stopped">已停止</span>';
+}
+
+function init() {
+  renderAccounts();
+  updateScanCount();
+}
+init();
 </script>
 </body>
 </html>`;
