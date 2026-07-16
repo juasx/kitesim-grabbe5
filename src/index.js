@@ -106,7 +106,7 @@ const HTML = `<!DOCTYPE html>
   function addLog(text) {
     const log = document.getElementById('log');
     const time = new Date().toLocaleTimeString();
-    log.innerHTML = `<div>[${time}] ${text}</div>` + log.innerHTML;
+    log.innerHTML = '<div>[' + time + '] ' + text + '</div>' + log.innerHTML;
   }
 
   function updateScanCount() {
@@ -120,12 +120,7 @@ const HTML = `<!DOCTYPE html>
       const isLocked = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee;';
-      div.innerHTML = `
-        <div><strong>${acc.email}</strong> ${isLocked ? '<span style="color:#c8102e">[已锁定]</span>' : ''}</div>
-        <div>
-          <button onclick="resetAccount(${i})">重置</button>
-          <button onclick="removeAccount(${i})" style="color:#c8102e">删除</button>
-        </div>`;
+      div.innerHTML = '<div><strong>' + acc.email + '</strong> ' + (isLocked ? '<span style="color:#c8102e">[已锁定]</span>' : '') + '</div><div><button onclick="resetAccount(' + i + ')">重置</button><button onclick="removeAccount(' + i + ')" style="color:#c8102e">删除</button></div>';
       container.appendChild(div);
     });
     updateAccountSelect();
@@ -174,7 +169,7 @@ const HTML = `<!DOCTYPE html>
       return;
     }
     const w = window.open('', '_blank');
-    w.document.write(`<pre>已扫到 ${seenNumbersList.length} 个唯一号码：\n\n${seenNumbersList.join('\n')}</pre>`);
+    w.document.write('<pre>已扫到 ' + seenNumbersList.length + ' 个唯一号码：\n\n' + seenNumbersList.join('\n') + '</pre>');
   }
 
   function matchesPattern(last4, pattern) {
@@ -196,10 +191,9 @@ const HTML = `<!DOCTYPE html>
     } catch { return false; }
   }
 
-  // 新增：校验未支付列表（status=2）
   async function checkUnpaidNumber(phone, token) {
     try {
-      const res = await fetch(`/api/userPhonePurchase/getOrderPage?page=1&size=20&status=2&phone=`, { headers: { token } });
+      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=20&status=2&phone=', { headers: { token } });
       const json = await res.json();
       if (json.code === 200 && json.data?.records) {
         return json.data.records.some(r => r.phoneNumber === phone);
@@ -235,7 +229,6 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 核心逻辑（已增加未支付校验） ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -283,21 +276,20 @@ const HTML = `<!DOCTYPE html>
       }
 
       if (!matchedPhone) {
-        addLog(`共轮询 ${totalScanned} 次 | 无符合号码`);
+        addLog('共轮询 ' + totalScanned + ' 次 | 无符合号码');
         return;
       }
 
-      addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}，开始占号...`);
+      addLog('发现 ' + matchedClass + '类 号码 ' + matchedPhone + '，开始占号...');
 
       const buyRes = await buyNumber(matchedPhone, acc.token);
 
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
-        // 关键：占号后校验未支付列表
-        addLog(`占号接口返回成功，正在校验未支付列表...`);
+        addLog('占号接口返回成功，正在校验未支付列表...');
         const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
 
         if (isInUnpaid) {
-          addLog(`【占号成功并已校验】${matchedClass}类 号码 ${matchedPhone}（未支付列表已出现）`);
+          addLog('【占号成功并已校验】' + matchedClass + '类 号码 ' + matchedPhone + '（未支付列表已出现）');
 
           try {
             await confirmPay(buyRes.data.orderNo, acc.token);
@@ -308,10 +300,10 @@ const HTML = `<!DOCTYPE html>
           renderAccounts();
           stopGrab();
         } else {
-          addLog(`【占号后校验失败】${matchedPhone} 未在未支付列表中出现`);
+          addLog('【占号后校验失败】' + matchedPhone + ' 未在未支付列表中出现');
         }
       } else {
-        addLog(`【占号失败】${matchedClass}类 号码 ${matchedPhone} | ${buyRes.message || 'Server Exception'}`);
+        addLog('【占号失败】' + matchedClass + '类 号码 ' + matchedPhone + ' | ' + (buyRes.message || 'Server Exception'));
       }
 
     } catch (e) {
