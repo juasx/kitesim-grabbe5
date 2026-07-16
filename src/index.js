@@ -89,8 +89,11 @@ const HTML = `<!DOCTYPE html>
           <select id="selectedAccount"></select>
         </div>
         <div style="margin-top:12px;">
-          <label>分类匹配（格式：aaab:1110 3331 8883, abbb:1000）</label>
-          <input id="patterns" value="aaab:1110 3331 8883, abbb:1000, aaaa:1111">
+          <label>要匹配的类（aaab, abbb, aaaa）</label>
+          <input id="patterns" value="aaab, abbb, aaaa">
+        </div>
+        <div style="margin-top:8px; font-size:13px; color:#666;">
+          只购买季包 0.3 的号码
         </div>
         <div style="margin-top:16px; display:flex; gap:10px;">
           <button class="btn" onclick="startGrab()">开始抢号（每10秒）</button>
@@ -318,7 +321,7 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 支持分类多尾号匹配 ====================
+  // ==================== 只要匹配类 + 只买0.3季包就锁 ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -353,32 +356,23 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
-      // 解析 aaab:1110 3331 8883 格式
-      const rawPatterns = document.getElementById('patterns').value.split(',');
-      const patternGroups = {}; // { aaab: ['1110','3331','8883'], ... }
-
-      rawPatterns.forEach(item => {
-        const trimmed = item.trim();
-        if (!trimmed) return;
-        const [className, ...tails] = trimmed.split(/[:\s]+/);
-        if (className && tails.length > 0) {
-          patternGroups[className] = tails;
-        }
-      });
+      const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
 
       let matchedPhone = null;
       let matchedClass = '';
-      let matchedTail = '';
 
       for (const item of numRes.data) {
         if (!item.phoneNumber) continue;
+        
+        // 只买季包 0.3
+        if (item.buyPrice !== 0.30) continue;
+
         const last4 = item.phoneNumber.slice(-4);
 
-        for (const [className, tails] of Object.entries(patternGroups)) {
-          if (tails.includes(last4)) {
+        for (const p of patterns) {
+          if (last4 === p) {
             matchedPhone = item.phoneNumber;
-            matchedClass = className;
-            matchedTail = last4;
+            matchedClass = p;
             break;
           }
         }
@@ -386,11 +380,11 @@ const HTML = `<!DOCTYPE html>
       }
 
       if (!matchedPhone) {
-        addLog(\`共轮询 \${totalScanned} 次 | 本次无匹配尾号，跳过\`);
+        addLog(\`共轮询 \${totalScanned} 次 | 本次无符合条件的号码，跳过\`);
         return;
       }
 
-      addLog(\`发现匹配号码 \${matchedPhone}，开始自动购买...\`);
+      addLog(\`发现 \${matchedClass}类 号码 \${matchedPhone}（0.3季包），开始购买...\`);
 
       const buyRes = await buyNumber(matchedPhone, acc.token);
 
@@ -402,7 +396,7 @@ const HTML = `<!DOCTYPE html>
         resultText = \`占号失败（\${buyRes.message || '未知'}）→ 已记录为成功\`;
       }
 
-      addLog(\`发现匹配号码 \${matchedPhone} 结果：\${matchedClass}类 (匹配到 \${matchedTail}) | \${resultText}\`);
+      addLog(\`【锁定】\${matchedClass}类 号码 \${matchedPhone} | \${resultText}\`);
 
       grabbedAccounts.push(acc.email);
       saveGrabbed();
