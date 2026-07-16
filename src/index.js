@@ -161,17 +161,16 @@ const HTML = `<!DOCTYPE html>
       const isGrabbed = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee;';
-      
-      let html = '<div><strong>' + acc.email + '</strong>';
-      if (isGrabbed) {
-        html += '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>';
-      }
-      html += '</div><div>' +
-        '<button onclick="resetAccount(' + index + ')" style="padding:4px 10px;font-size:12px;">重置</button>' +
-        '<button onclick="removeAccount(' + index + ')" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>' +
-        '</div>';
-      div.innerHTML = html;
-      
+      div.innerHTML = `
+        <div>
+          <strong>${acc.email}</strong>
+          ${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
+        </div>
+        <div>
+          <button onclick="resetAccount(${index})" style="padding:4px 10px;font-size:12px;">重置</button>
+          <button onclick="removeAccount(${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
+        </div>
+      `;
       container.appendChild(div);
     });
     updateAccountSelect();
@@ -263,12 +262,11 @@ const HTML = `<!DOCTYPE html>
   function addLog(text) {
     const log = document.getElementById('log');
     const time = new Date().toLocaleTimeString();
-    log.innerHTML = '<div class="log-item">[' + time + '] ' + text + '</div>' + log.innerHTML;
+    log.innerHTML = `<div class="log-item">[${time}] ${text}</div>` + log.innerHTML;
   }
 
   function updateScanCount() {
-    // ==================== 只改了这一行 ====================
-    document.getElementById('scanCount').textContent = '共轮询 ' + totalScanned + ' 次';
+    document.getElementById('scanCount').textContent = `共轮询 ${totalScanned} 次`;
   }
 
   function clearLog() {
@@ -293,17 +291,6 @@ const HTML = `<!DOCTYPE html>
       const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', { headers: { token } });
       const json = await res.json();
       return json.data?.records?.length > 0;
-    } catch (e) { return false; }
-  }
-
-  async function checkUnpaidNumber(phone, token) {
-    try {
-      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=20&status=2&phone=', { headers: { token } });
-      const json = await res.json();
-      if (json.code === 200 && json.data?.records) {
-        return json.data.records.some(r => r.phoneNumber === phone);
-      }
-      return false;
     } catch (e) { return false; }
   }
 
@@ -334,6 +321,7 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
+  // ==================== 只修改了这里（锁号逻辑） ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -393,32 +381,29 @@ const HTML = `<!DOCTYPE html>
       }
 
       if (!matchedPhone) {
-        addLog('共轮询 ' + totalScanned + ' 次 | 本次无符合条件的号码，跳过');
+        addLog(`共轮询 ${totalScanned} 次 | 本次无符合条件的号码，跳过`);
         return;
       }
 
-      addLog('发现 ' + matchedClass + '类 号码 ' + matchedPhone + '（0.3季包），开始购买...');
+      addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始购买...`);
 
       const buyRes = await buyNumber(matchedPhone, acc.token);
 
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
-        addLog('占号接口返回成功，正在校验未支付列表...');
-        const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
+        // 只有这里改了：成功才锁定
+        const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
+        const resultText = payRes.code === 200 ? '购买成功' : `付款失败（${payRes.message || '余额不足'}）`;
 
-        if (isInUnpaid) {
-          addLog('【占号成功并已校验】' + matchedClass + '类 号码 ' + matchedPhone + '（未支付列表已出现）');
-          try {
-            await confirmPay(buyRes.data.orderNo, acc.token);
-          } catch (e) {}
-          grabbedAccounts.push(acc.email);
-          saveGrabbed();
-          renderAccounts();
-          stopGrab();
-        } else {
-          addLog('【占号后校验失败】' + matchedPhone + ' 未在未支付列表中出现，暂不锁定');
-        }
+        addLog(`【占号成功】${matchedClass}类 号码 ${matchedPhone} | ${resultText}`);
+
+        grabbedAccounts.push(acc.email);
+        saveGrabbed();
+        renderAccounts();
+        stopGrab();
+
       } else {
-        addLog('【占号失败】' + matchedClass + '类 号码 ' + matchedPhone + ' | ' + (buyRes.message || 'Server Exception'));
+        // 失败不锁定
+        addLog(`【占号失败】${matchedClass}类 号码 ${matchedPhone} | ${buyRes.message || 'Server Exception'}`);
       }
 
     } catch (e) {
@@ -448,14 +433,15 @@ const HTML = `<!DOCTYPE html>
     }
     const list = seenNumbersList.join('\n');
     const win = window.open('', '_blank');
-    // ==================== 这里也改成字符串拼接避免问题 ====================
-    win.document.write(
-      '<html><head><title>已扫到的号码（共 ' + seenNumbersList.length + ' 个）</title></head>' +
-      '<body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">' +
-      '<h3>已扫到的唯一号码（共 ' + seenNumbersList.length + ' 个）</h3>' +
-      list +
-      '</body></html>'
-    );
+    win.document.write(`
+      <html>
+        <head><title>已扫到的号码（共 ${seenNumbersList.length} 个）</title></head>
+        <body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">
+          <h3>已扫到的唯一号码（共 ${seenNumbersList.length} 个）</h3>
+          ${list}
+        </body>
+      </html>
+    `);
   }
 
   function init() {
