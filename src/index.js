@@ -55,41 +55,69 @@ const HTML = `<!DOCTYPE html>
     .status { font-size: 13px; padding: 6px 12px; border-radius: 20px; }
     .status.running { background: #d4edda; color: #155724; }
     .status.stopped { background: #f8d7da; color: #721c24; }
+    .page { display: none; }
+    .page.active { display: block; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h2>Kite Grabber - CA 0.3季包（已加未支付校验）</h2>
-    
-    <div class="card">
-      <h3>已添加账号</h3>
-      <div id="accountList"></div>
-      <button class="btn secondary" onclick="goAddAccount()" style="margin-top:12px;">添加账号</button>
+
+    <!-- 主页面 -->
+    <div class="page active" id="pageMain">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+        <h2 style="margin:0;">Kite Grabber</h2>
+        <button class="btn secondary" onclick="goAddAccount()" style="width:auto; padding:8px 16px;">添加账号</button>
+      </div>
+
+      <div class="card">
+        <h3>已添加账号</h3>
+        <div id="accountList"></div>
+      </div>
+
+      <div class="card">
+        <h3>抢号设置</h3>
+        <select id="selectedAccount" style="margin-bottom:12px;"></select>
+        
+        <label>匹配规则（aaab, abbb, aaaa, abab, abba）</label>
+        <input id="patterns" value="aaab, abbb, aaaa, abab, abba">
+        
+        <div style="margin:16px 0; display:flex; gap:10px;">
+          <button class="btn" onclick="startGrab()">开始抢号（每10秒）</button>
+          <button class="btn secondary" onclick="stopGrab()">停止</button>
+        </div>
+        <div id="grabStatus"></div>
+        <div>已扫描：<span id="scanCount">0</span> 次</div>
+      </div>
+
+      <div class="card">
+        <h3>日志</h3>
+        <div id="log" class="log"></div>
+        <div style="display:flex; gap:10px; margin-top:10px;">
+          <button class="btn secondary" onclick="clearLog()" style="flex:1;">清空日志</button>
+          <button class="btn secondary" onclick="showSeenNumbers()" style="flex:1;">查看已扫号码</button>
+        </div>
+      </div>
     </div>
 
-    <div class="card">
-      <h3>抢号设置</h3>
-      <select id="selectedAccount" style="margin-bottom:12px;"></select>
-      
-      <label>匹配规则（aaab, abbb, aaaa, abab, abba）</label>
-      <input id="patterns" value="aaab, abbb, aaaa, abab, abba">
-      
-      <div style="margin:16px 0; display:flex; gap:10px;">
-        <button class="btn" onclick="startGrab()">开始抢号（每10秒）</button>
-        <button class="btn secondary" onclick="stopGrab()">停止</button>
+    <!-- 添加账号页面 -->
+    <div class="page" id="pageAddAccount">
+      <div style="display:flex; align-items:center; margin-bottom:16px;">
+        <button class="btn secondary" onclick="goMain()" style="width:auto; padding:8px 16px; margin-right:12px;">返回</button>
+        <h2 style="margin:0;">添加账号</h2>
       </div>
-      <div id="grabStatus"></div>
-      <div>已扫描：<span id="scanCount">0</span> 次</div>
+      
+      <div class="card">
+        <input id="email" type="email" placeholder="邮箱">
+        <input id="pass" type="password" placeholder="密码">
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:12px;">
+          <input id="captchaCode" placeholder="验证码" style="flex:1; margin-bottom:0;">
+          <img id="captchaImg" onclick="loadCaptcha()" style="height:46px; width:110px; border-radius:10px; cursor:pointer;">
+        </div>
+        <button class="btn" onclick="doLogin()">登录并添加</button>
+        <div id="loginMsg" style="margin-top:10px; text-align:center; font-size:14px;"></div>
+      </div>
     </div>
 
-    <div class="card">
-      <h3>日志</h3>
-      <div id="log" class="log"></div>
-      <div style="display:flex; gap:10px; margin-top:10px;">
-        <button class="btn secondary" onclick="clearLog()" style="flex:1;">清空日志</button>
-        <button class="btn secondary" onclick="showSeenNumbers()" style="flex:1;">查看已扫号码（去重）</button>
-      </div>
-    </div>
   </div>
 
 <script>
@@ -99,9 +127,26 @@ const HTML = `<!DOCTYPE html>
   let totalScanned = 0;
   let seenNumbers = new Set();
   let seenNumbersList = [];
+  let captchaKey = '';
 
   function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
   function saveGrabbed() { localStorage.setItem('grabbed_accounts', JSON.stringify(grabbedAccounts)); }
+
+  function showPage(id) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+  }
+
+  function goMain() {
+    showPage('pageMain');
+    renderAccounts();
+  }
+
+  function goAddAccount() {
+    showPage('pageAddAccount');
+    loadCaptcha();
+    document.getElementById('loginMsg').textContent = '';
+  }
 
   function addLog(text) {
     const log = document.getElementById('log');
@@ -116,11 +161,16 @@ const HTML = `<!DOCTYPE html>
   function renderAccounts() {
     const container = document.getElementById('accountList');
     container.innerHTML = '';
+    if (accounts.length === 0) {
+      container.innerHTML = '<div style="color:#888;">还没有账号，点击右上角“添加账号”</div>';
+      return;
+    }
     accounts.forEach((acc, i) => {
       const isLocked = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee;';
-      div.innerHTML = '<div><strong>' + acc.email + '</strong> ' + (isLocked ? '<span style="color:#c8102e">[已锁定]</span>' : '') + '</div><div><button onclick="resetAccount(' + i + ')">重置</button><button onclick="removeAccount(' + i + ')" style="color:#c8102e">删除</button></div>';
+      div.innerHTML = '<div><strong>' + acc.email + '</strong> ' + (isLocked ? '<span style="color:#c8102e">[已锁定]</span>' : '') + '</div>' +
+        '<div><button onclick="resetAccount(' + i + ')">重置</button><button onclick="removeAccount(' + i + ')" style="color:#c8102e">删除</button></div>';
       container.appendChild(div);
     });
     updateAccountSelect();
@@ -170,6 +220,64 @@ const HTML = `<!DOCTYPE html>
     }
     const w = window.open('', '_blank');
     w.document.write('<pre>已扫到 ' + seenNumbersList.length + ' 个唯一号码：\n\n' + seenNumbersList.join('\n') + '</pre>');
+  }
+
+  async function loadCaptcha() {
+    try {
+      const res = await fetch('/api/index/captcha-image-base64');
+      const json = await res.json();
+      if (json.captchaKey) {
+        captchaKey = json.captchaKey;
+        document.getElementById('captchaImg').src = 'data:image/png;base64,' + json.captchaImageBase64;
+      }
+    } catch (e) {}
+  }
+
+  async function doLogin() {
+    const email = document.getElementById('email').value.trim();
+    const pass = document.getElementById('pass').value;
+    const code = document.getElementById('captchaCode').value.trim();
+    const msg = document.getElementById('loginMsg');
+
+    if (!email || !pass || !code) {
+      msg.textContent = '请填写完整';
+      msg.style.color = '#c8102e';
+      return;
+    }
+
+    msg.textContent = '登录中...';
+    msg.style.color = '#333';
+
+    try {
+      const res = await fetch('/api/index/sign-in', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, pass, captchaCode: code, captchaKey })
+      });
+      const json = await res.json();
+
+      if (json.code === 200 && json.data) {
+        if (accounts.some(a => a.email === email)) {
+          msg.textContent = '该账号已存在';
+          msg.style.color = '#c8102e';
+          return;
+        }
+        accounts.push({ email, token: json.data });
+        saveAccounts();
+        msg.textContent = '添加成功！';
+        msg.style.color = '#34c759';
+        setTimeout(() => {
+          goMain();
+        }, 600);
+      } else {
+        msg.textContent = json.message || '登录失败';
+        msg.style.color = '#c8102e';
+        loadCaptcha();
+      }
+    } catch (e) {
+      msg.textContent = '网络错误';
+      msg.style.color = '#c8102e';
+    }
   }
 
   function matchesPattern(last4, pattern) {
@@ -289,7 +397,7 @@ const HTML = `<!DOCTYPE html>
         const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
 
         if (isInUnpaid) {
-          addLog('【占号成功并已校验】' + matchedClass + '类 号码 ' + matchedPhone + '（未支付列表已出现）');
+          addLog('【占号成功并已校验】' + matchedClass + '类 号码 ' + matchedPhone);
 
           try {
             await confirmPay(buyRes.data.orderNo, acc.token);
