@@ -50,80 +50,118 @@ const HTML = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Kite Grabber</title>
   <style>
-    body { font-family: system-ui; background: #f5f5f7; margin: 0; padding: 20px; }
+    body { font-family: system-ui; background: #f5f5f7; margin: 0; padding: 16px; }
     .container { max-width: 720px; margin: 0 auto; }
-    .card { background: white; border-radius: 16px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-    .btn { background: #c8102e; color: white; border: none; padding: 12px 20px; border-radius: 12px; font-size: 15px; cursor: pointer; width: 100%; }
+    .card { background: white; border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .btn { background: #c8102e; color: white; border: none; padding: 12px 18px; border-radius: 12px; font-size: 15px; cursor: pointer; width: 100%; }
     .btn.secondary { background: #f0f0f3; color: #333; }
-    input, select { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 12px; margin-bottom: 12px; }
-    .log { background: #f8f9fa; padding: 12px; border-radius: 12px; max-height: 300px; overflow-y: auto; font-size: 13px; }
-    .log-item { padding: 6px 0; border-bottom: 1px solid #eee; }
+    input, select { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 12px; margin-bottom: 12px; font-size: 15px; }
+    .log { background: #f8f9fa; padding: 12px; border-radius: 12px; max-height: 320px; overflow-y: auto; font-size: 13px; line-height: 1.5; }
+    .log-item { padding: 5px 0; border-bottom: 1px solid #eee; }
     .status { font-size: 13px; padding: 6px 12px; border-radius: 20px; display: inline-block; }
     .status.running { background: #d4edda; color: #155724; }
     .status.stopped { background: #f8d7da; color: #721c24; }
+    .page { display: none; }
+    .page.active { display: block; }
+    .nav { display: flex; align-items: center; margin-bottom: 16px; }
+    .nav-title { font-size: 20px; font-weight: 700; flex: 1; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h2 style="text-align:center; margin-bottom:24px;">Kite Grabber（多账号抢号器）</h2>
 
-    <!-- 账号管理 -->
-    <div class="card">
-      <h3>账号管理</h3>
-      <div style="display:flex; gap:10px; margin-bottom:12px;">
-        <input id="email" placeholder="邮箱">
+    <!-- 主页 -->
+    <div class="page active" id="pageMain">
+      <div class="nav">
+        <div class="nav-title">Kite Grabber</div>
+        <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goAddAccount()">添加账号</button>
+      </div>
+
+      <!-- 账号列表 -->
+      <div class="card">
+        <h3 style="margin:0 0 12px 0;">已添加账号</h3>
+        <div id="accountList"></div>
+      </div>
+
+      <!-- 抢号设置 -->
+      <div class="card">
+        <h3 style="margin:0 0 12px 0;">抢号设置</h3>
+        <div>
+          <label>选择账号</label>
+          <select id="selectedAccount"></select>
+        </div>
+        <div style="margin-top:12px;">
+          <label>尾号匹配（逗号分隔）</label>
+          <input id="patterns" value="aaab,abbb,aaaa">
+        </div>
+        <div style="margin-top:16px; display:flex; gap:10px;">
+          <button class="btn" onclick="startGrab()">开始抢号（每10秒）</button>
+          <button class="btn secondary" onclick="stopGrab()">停止</button>
+        </div>
+        <div id="grabStatus" style="margin-top:12px;"></div>
+      </div>
+
+      <!-- 日志 -->
+      <div class="card">
+        <h3 style="margin:0 0 8px 0;">抢号日志 <span id="scanCount" style="font-size:13px;color:#666;"></span></h3>
+        <div id="log" class="log"></div>
+        <button class="btn secondary" style="margin-top:10px;" onclick="clearLog()">清空日志</button>
+      </div>
+    </div>
+
+    <!-- 添加账号页（登录页） -->
+    <div class="page" id="pageAddAccount">
+      <div class="nav">
+        <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goMain()">返回</button>
+        <div class="nav-title" style="text-align:center;">添加账号</div>
+        <div style="width:60px"></div>
+      </div>
+
+      <div class="card">
+        <input id="email" type="email" placeholder="邮箱">
         <input id="pass" type="password" placeholder="密码">
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:12px;">
+          <input id="captchaCode" placeholder="验证码" style="flex:1; margin-bottom:0;">
+          <img id="captchaImg" onclick="loadCaptcha()" style="height:46px; width:110px; border-radius:10px; cursor:pointer;">
+        </div>
+        <button class="btn" onclick="doLogin()">登录并添加</button>
+        <div id="loginMsg" style="margin-top:10px; text-align:center; font-size:14px;"></div>
       </div>
-      <button class="btn" onclick="addAccount()">添加账号</button>
-      <div id="accountList" style="margin-top:16px;"></div>
     </div>
 
-    <!-- 抢号设置 -->
-    <div class="card">
-      <h3>抢号设置</h3>
-      <div>
-        <label>选择账号</label>
-        <select id="selectedAccount"></select>
-      </div>
-      <div style="margin-top:12px;">
-        <label>尾号匹配（逗号分隔）</label>
-        <input id="patterns" value="aaab,abbb,aaaa" placeholder="aaab,abbb,aaaa">
-      </div>
-      <div style="margin-top:16px; display:flex; gap:10px;">
-        <button class="btn" onclick="startGrab()">开始抢号（每10秒）</button>
-        <button class="btn secondary" onclick="stopGrab()">停止</button>
-      </div>
-      <div id="grabStatus" style="margin-top:12px;"></div>
-    </div>
-
-    <!-- 日志 -->
-    <div class="card">
-      <h3>抢号日志</h3>
-      <div id="log" class="log"></div>
-      <button class="btn secondary" style="margin-top:12px;" onclick="clearLog()">清空日志</button>
-    </div>
   </div>
 
 <script>
   let accounts = JSON.parse(localStorage.getItem('grabber_accounts') || '[]');
-  let grabInterval = null;
-  let currentAccountIndex = null;
   let grabbedAccounts = JSON.parse(localStorage.getItem('grabbed_accounts') || '[]');
+  let grabInterval = null;
+  let captchaKey = '';
+  let totalScanned = 0;
 
-  function saveAccounts() {
-    localStorage.setItem('grabber_accounts', JSON.stringify(accounts));
+  function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
+  function saveGrabbed() { localStorage.setItem('grabbed_accounts', JSON.stringify(grabbedAccounts)); }
+
+  function showPage(id) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
   }
 
-  function saveGrabbed() {
-    localStorage.setItem('grabbed_accounts', JSON.stringify(grabbedAccounts));
+  function goMain() {
+    showPage('pageMain');
+    renderAccounts();
+  }
+
+  function goAddAccount() {
+    showPage('pageAddAccount');
+    loadCaptcha();
+    document.getElementById('loginMsg').textContent = '';
   }
 
   function renderAccounts() {
     const container = document.getElementById('accountList');
     container.innerHTML = '';
-    
     if (accounts.length === 0) {
-      container.innerHTML = '<div style="color:#888;">还没有账号</div>';
+      container.innerHTML = '<div style="color:#888;">还没有账号，点击右上角“添加账号”</div>';
       return;
     }
 
@@ -134,7 +172,7 @@ const HTML = `<!DOCTYPE html>
       div.innerHTML = \`
         <div>
           <strong>\${acc.email}</strong>
-          \${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢]</span>' : ''}
+          \${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
         </div>
         <div>
           <button onclick="resetAccount(\${index})" style="padding:4px 10px;font-size:12px;">重置</button>
@@ -144,7 +182,6 @@ const HTML = `<!DOCTYPE html>
       container.appendChild(div);
     });
 
-    // 更新选择框
     updateAccountSelect();
   }
 
@@ -161,25 +198,66 @@ const HTML = `<!DOCTYPE html>
     });
   }
 
-  async function addAccount() {
+  async function loadCaptcha() {
+    try {
+      const res = await fetch('/api/index/captcha-image-base64');
+      const json = await res.json();
+      if (json.captchaKey) {
+        captchaKey = json.captchaKey;
+        document.getElementById('captchaImg').src = 'data:image/png;base64,' + json.captchaImageBase64;
+      }
+    } catch (e) {}
+  }
+
+  async function doLogin() {
     const email = document.getElementById('email').value.trim();
     const pass = document.getElementById('pass').value;
-    if (!email || !pass) return alert('请填写邮箱和密码');
+    const code = document.getElementById('captchaCode').value.trim();
+    const msg = document.getElementById('loginMsg');
 
-    // 这里简化处理，实际应该调用登录接口
-    // 为了演示，我们先手动输入 token（你可以用之前的登录方式获取）
-    const token = prompt('请输入该账号的 token（从浏览器开发者工具获取）:');
-    if (!token) return;
+    if (!email || !pass || !code) {
+      msg.textContent = '请填写完整';
+      msg.style.color = '#c8102e';
+      return;
+    }
 
-    accounts.push({ email, token });
-    saveAccounts();
-    renderAccounts();
-    document.getElementById('email').value = '';
-    document.getElementById('pass').value = '';
+    msg.textContent = '登录中...';
+    msg.style.color = '#333';
+
+    try {
+      const res = await fetch('/api/index/sign-in', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, pass, captchaCode: code, captchaKey })
+      });
+      const json = await res.json();
+
+      if (json.code === 200 && json.data) {
+        if (accounts.some(a => a.email === email)) {
+          msg.textContent = '该账号已存在';
+          msg.style.color = '#c8102e';
+          return;
+        }
+        accounts.push({ email, token: json.data });
+        saveAccounts();
+        msg.textContent = '添加成功！';
+        msg.style.color = '#34c759';
+        setTimeout(() => {
+          goMain();
+        }, 600);
+      } else {
+        msg.textContent = json.message || '登录失败';
+        msg.style.color = '#c8102e';
+        loadCaptcha();
+      }
+    } catch (e) {
+      msg.textContent = '网络错误';
+      msg.style.color = '#c8102e';
+    }
   }
 
   function removeAccount(index) {
-    if (!confirm('确定删除该账号？')) return;
+    if (!confirm('确定删除？')) return;
     const email = accounts[index].email;
     accounts.splice(index, 1);
     grabbedAccounts = grabbedAccounts.filter(e => e !== email);
@@ -193,7 +271,7 @@ const HTML = `<!DOCTYPE html>
     grabbedAccounts = grabbedAccounts.filter(e => e !== email);
     saveGrabbed();
     renderAccounts();
-    alert('已重置该账号，可再次抢号');
+    alert('已重置，可再次抢号');
   }
 
   function addLog(text) {
@@ -202,26 +280,26 @@ const HTML = `<!DOCTYPE html>
     log.innerHTML = \`<div class="log-item">[\${time}] \${text}</div>\` + log.innerHTML;
   }
 
+  function updateScanCount() {
+    document.getElementById('scanCount').textContent = \`共扫到 \${totalScanned} 个\`;
+  }
+
   function clearLog() {
     document.getElementById('log').innerHTML = '';
+    totalScanned = 0;
+    updateScanCount();
   }
 
   async function checkHasPaidNumber(token) {
     try {
-      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', {
-        headers: { token }
-      });
+      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', { headers: { token } });
       const json = await res.json();
-      return json.data && json.data.records && json.data.records.length > 0;
-    } catch (e) {
-      return false;
-    }
+      return json.data?.records?.length > 0;
+    } catch (e) { return false; }
   }
 
   async function getNewNumber(token) {
-    const res = await fetch('/api/countryCode/getPhoneNumber/CA', {
-      headers: { token }
-    });
+    const res = await fetch('/api/countryCode/getPhoneNumber/CA', { headers: { token } });
     return await res.json();
   }
 
@@ -233,9 +311,7 @@ const HTML = `<!DOCTYPE html>
         body: JSON.stringify({ phoneNumber, countryCode: 'CA' })
       });
       return await res.json();
-    } catch (e) {
-      return { code: 0, message: e.message };
-    }
+    } catch (e) { return { code: 0, message: e.message }; }
   }
 
   async function confirmPay(orderNo, token) {
@@ -246,9 +322,7 @@ const HTML = `<!DOCTYPE html>
         body: JSON.stringify({ orderNo })
       });
       return await res.json();
-    } catch (e) {
-      return { code: 0, message: e.message };
-    }
+    } catch (e) { return { code: 0, message: e.message }; }
   }
 
   async function pollOnce() {
@@ -259,14 +333,12 @@ const HTML = `<!DOCTYPE html>
     const acc = accounts[index];
     if (!acc) return;
 
-    // 检查是否已抢过
     if (grabbedAccounts.includes(acc.email)) {
       addLog(\`\${acc.email} 已抢过，跳过\`);
       stopGrab();
       return;
     }
 
-    // 检查是否已有付费号码
     const hasPaid = await checkHasPaidNumber(acc.token);
     if (hasPaid) {
       addLog(\`\${acc.email} 已有付费CA号，自动锁定\`);
@@ -279,6 +351,9 @@ const HTML = `<!DOCTYPE html>
 
     try {
       const numRes = await getNewNumber(acc.token);
+      totalScanned++;
+      updateScanCount();
+
       if (numRes.code !== 200 || !numRes.data?.phoneNumber) {
         addLog('获取号码失败');
         return;
@@ -286,33 +361,32 @@ const HTML = `<!DOCTYPE html>
 
       const phone = numRes.data.phoneNumber;
       const last4 = phone.slice(-4);
-
       const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
       const matched = patterns.some(p => last4 === p);
 
       if (!matched) {
-        addLog(\`获取 \${phone}，不匹配，跳过\`);
+        addLog(\`共扫到 \${totalScanned} 个 | \${phone} 不匹配，跳过\`);
         return;
       }
 
-      addLog(\`匹配成功！\${phone}，正在自动购买...\`);
+      addLog(\`发现匹配号码 \${phone}，开始自动购买...\`);
 
-      // 尝试购买
       const buyRes = await buyNumber(phone, acc.token);
-      
+
+      let resultText = '';
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
         const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
-        
         if (payRes.code === 200) {
-          addLog(\`✅ 抢号成功！\${phone}\`);
+          resultText = '购买成功';
         } else {
-          addLog(\`付款失败（余额不足或其他）：\${payRes.message || '未知'} → 已记录为成功\`);
+          resultText = '付款失败（余额不足或其他）→ 已记录为成功';
         }
       } else {
-        addLog(\`占号失败：\${buyRes.message || '未知'} → 已记录为成功\`);
+        resultText = '占号失败 → 已记录为成功';
       }
 
-      // 无论成功失败，都标记为已抢
+      addLog(\`发现匹配号码 \${phone} 结果：\${resultText}\`);
+
       grabbedAccounts.push(acc.email);
       saveGrabbed();
       renderAccounts();
@@ -325,31 +399,23 @@ const HTML = `<!DOCTYPE html>
 
   function startGrab() {
     if (grabInterval) clearInterval(grabInterval);
-    
     const select = document.getElementById('selectedAccount');
-    if (!select.value) {
-      alert('请选择账号');
-      return;
-    }
+    if (!select.value) { alert('请选择账号'); return; }
 
     document.getElementById('grabStatus').innerHTML = '<span class="status running">正在抢号中...</span>';
-    
-    pollOnce(); // 立即执行一次
+    pollOnce();
     grabInterval = setInterval(pollOnce, 10000);
   }
 
   function stopGrab() {
-    if (grabInterval) {
-      clearInterval(grabInterval);
-      grabInterval = null;
-    }
+    if (grabInterval) clearInterval(grabInterval);
+    grabInterval = null;
     document.getElementById('grabStatus').innerHTML = '<span class="status stopped">已停止</span>';
   }
 
-  // 初始化
   function init() {
     renderAccounts();
-    updateAccountSelect();
+    updateScanCount();
   }
 
   init();
