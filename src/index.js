@@ -161,16 +161,18 @@ const HTML = `<!DOCTYPE html>
       const isGrabbed = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee;';
-      div.innerHTML = `
-        <div>
-          <strong>${acc.email}</strong>
-          ${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
-        </div>
-        <div>
-          <button onclick="resetAccount(${index})" style="padding:4px 10px;font-size:12px;">重置</button>
-          <button onclick="removeAccount(${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
-        </div>
-      `;
+      
+      // ==================== 只改了这里（避免嵌套模板字符串） ====================
+      let html = '<div><strong>' + acc.email + '</strong>';
+      if (isGrabbed) {
+        html += '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>';
+      }
+      html += '</div><div>' +
+        '<button onclick="resetAccount(' + index + ')" style="padding:4px 10px;font-size:12px;">重置</button>' +
+        '<button onclick="removeAccount(' + index + ')" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>' +
+        '</div>';
+      div.innerHTML = html;
+      
       container.appendChild(div);
     });
     updateAccountSelect();
@@ -294,7 +296,6 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return false; }
   }
 
-  // ==================== 新增：校验未支付列表（status=2） ====================
   async function checkUnpaidNumber(phone, token) {
     try {
       const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=20&status=2&phone=', { headers: { token } });
@@ -333,7 +334,6 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 核心抢号逻辑（已按HAR流程修改锁号） ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -403,17 +403,13 @@ const HTML = `<!DOCTYPE html>
 
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
         addLog(`占号接口返回成功，正在校验未支付列表...`);
-
-        // ==================== 关键修改：必须在未支付列表里出现才锁定 ====================
         const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
 
         if (isInUnpaid) {
           addLog(`【占号成功并已校验】${matchedClass}类 号码 ${matchedPhone}（未支付列表已出现）`);
-
           try {
             await confirmPay(buyRes.data.orderNo, acc.token);
           } catch (e) {}
-
           grabbedAccounts.push(acc.email);
           saveGrabbed();
           renderAccounts();
