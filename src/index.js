@@ -1,7 +1,6 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -11,7 +10,6 @@ export default {
         },
       });
     }
-
     if (url.pathname.startsWith("/api/")) {
       const targetPath = url.pathname.replace(/^\/api/, "") + url.search;
       const target = "https://api.kitesim.co" + targetPath;
@@ -22,13 +20,11 @@ export default {
       };
       const clientToken = request.headers.get("token");
       if (clientToken) headers["token"] = clientToken;
-
       let body = null;
       if (request.method === "POST" || request.method === "PUT") {
         body = await request.text();
         headers["Content-Type"] = "application/json";
       }
-
       const resp = await fetch(target, { method: request.method, headers, body });
       const data = await resp.text();
       return new Response(data, {
@@ -36,7 +32,6 @@ export default {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
-
     return new Response(HTML, {
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
@@ -69,19 +64,16 @@ const HTML = `<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
-
     <!-- 主页 -->
     <div class="page active" id="pageMain">
       <div class="nav">
         <div class="nav-title">Kite Grabber</div>
         <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goAddAccount()">添加账号</button>
       </div>
-
       <div class="card">
         <h3 style="margin:0 0 12px 0;">已添加账号</h3>
         <div id="accountList"></div>
       </div>
-
       <div class="card">
         <h3 style="margin:0 0 12px 0;">抢号设置</h3>
         <div>
@@ -89,8 +81,8 @@ const HTML = `<!DOCTYPE html>
           <select id="selectedAccount"></select>
         </div>
         <div style="margin-top:12px;">
-          <label>要匹配的类（aaab, abbb, aaaa）</label>
-          <input id="patterns" value="aaab, abbb, aaaa">
+          <label>要匹配的类（aaab, abbb, aaaa, abab, abba）</label>
+          <input id="patterns" value="aaab, abbb, aaaa, abab, abba">
         </div>
         <div style="margin-top:8px; font-size:13px; color:#666;">
           只购买季包 0.3 的号码
@@ -101,11 +93,14 @@ const HTML = `<!DOCTYPE html>
         </div>
         <div id="grabStatus" style="margin-top:12px;"></div>
       </div>
-
       <div class="card">
         <h3 style="margin:0 0 8px 0;">抢号日志 <span id="scanCount" style="font-size:13px;color:#666;"></span></h3>
         <div id="log" class="log"></div>
-        <button class="btn secondary" style="margin-top:10px;" onclick="clearLog()">清空日志</button>
+        
+        <div style="display:flex; gap:10px; margin-top:10px;">
+          <button class="btn secondary" onclick="clearLog()" style="flex:1;">清空日志</button>
+          <button class="btn secondary" onclick="showSeenNumbers()" style="flex:1;">查看已扫号码（去重）</button>
+        </div>
       </div>
     </div>
 
@@ -116,7 +111,6 @@ const HTML = `<!DOCTYPE html>
         <div class="nav-title" style="text-align:center;">添加账号</div>
         <div style="width:60px"></div>
       </div>
-
       <div class="card">
         <input id="email" type="email" placeholder="邮箱">
         <input id="pass" type="password" placeholder="密码">
@@ -128,7 +122,6 @@ const HTML = `<!DOCTYPE html>
         <div id="loginMsg" style="margin-top:10px; text-align:center; font-size:14px;"></div>
       </div>
     </div>
-
   </div>
 
 <script>
@@ -137,6 +130,10 @@ const HTML = `<!DOCTYPE html>
   let grabInterval = null;
   let captchaKey = '';
   let totalScanned = 0;
+
+  // 新增：记录已扫到的号码（去重）
+  let seenNumbers = new Set();
+  let seenNumbersList = [];
 
   function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
   function saveGrabbed() { localStorage.setItem('grabbed_accounts', JSON.stringify(grabbedAccounts)); }
@@ -212,16 +209,13 @@ const HTML = `<!DOCTYPE html>
     const pass = document.getElementById('pass').value;
     const code = document.getElementById('captchaCode').value.trim();
     const msg = document.getElementById('loginMsg');
-
     if (!email || !pass || !code) {
       msg.textContent = '请填写完整';
       msg.style.color = '#c8102e';
       return;
     }
-
     msg.textContent = '登录中...';
     msg.style.color = '#333';
-
     try {
       const res = await fetch('/api/index/sign-in', {
         method: 'POST',
@@ -229,7 +223,6 @@ const HTML = `<!DOCTYPE html>
         body: JSON.stringify({ email, pass, captchaCode: code, captchaKey })
       });
       const json = await res.json();
-
       if (json.code === 200 && json.data) {
         if (accounts.some(a => a.email === email)) {
           msg.textContent = '该账号已存在';
@@ -286,6 +279,19 @@ const HTML = `<!DOCTYPE html>
     updateScanCount();
   }
 
+  // ==================== 正确的匹配逻辑 ====================
+  function matchesPattern(last4, pattern) {
+    if (!last4 || last4.length !== 4) return false;
+    const [a, b, c, d] = last4.split('');
+    
+    if (pattern === 'aaaa') return a === b && b === c && c === d;
+    if (pattern === 'aaab') return a === b && b === c && c !== d;
+    if (pattern === 'abbb') return a !== b && b === c && c === d;
+    if (pattern === 'abab') return a === c && b === d && a !== b;
+    if (pattern === 'abba') return a === d && b === c && a !== b;
+    return false;
+  }
+
   async function checkHasPaidNumber(token) {
     try {
       const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', { headers: { token } });
@@ -321,11 +327,10 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 只要匹配类 + 只买0.3季包就锁 ====================
+  // ==================== 核心抢号逻辑（已修复） ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
-
     const index = parseInt(select.value);
     const acc = accounts[index];
     if (!acc) return;
@@ -356,23 +361,27 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
-      const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
+      // 记录本次扫到的所有号码（去重）
+      numRes.data.forEach(item => {
+        if (item.phoneNumber && !seenNumbers.has(item.phoneNumber)) {
+          seenNumbers.add(item.phoneNumber);
+          seenNumbersList.push(item.phoneNumber);
+        }
+      });
 
+      const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
       let matchedPhone = null;
       let matchedClass = '';
 
       for (const item of numRes.data) {
         if (!item.phoneNumber) continue;
-        
-        // 只买季包 0.3
-        if (item.buyPrice !== 0.30) continue;
+        if (item.buyPrice !== 0.30) continue; // 只买0.3季包
 
         const last4 = item.phoneNumber.slice(-4);
-
-        for (const p of patterns) {
-          if (last4 === p) {
+        for (const pat of patterns) {
+          if (matchesPattern(last4, pat)) {
             matchedPhone = item.phoneNumber;
-            matchedClass = p;
+            matchedClass = pat;
             break;
           }
         }
@@ -387,8 +396,8 @@ const HTML = `<!DOCTYPE html>
       addLog(\`发现 \${matchedClass}类 号码 \${matchedPhone}（0.3季包），开始购买...\`);
 
       const buyRes = await buyNumber(matchedPhone, acc.token);
-
       let resultText = '';
+
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
         const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
         resultText = payRes.code === 200 ? '购买成功' : \`付款失败（\${payRes.message || '余额不足'}）→ 已记录为成功\`;
@@ -397,7 +406,6 @@ const HTML = `<!DOCTYPE html>
       }
 
       addLog(\`【锁定】\${matchedClass}类 号码 \${matchedPhone} | \${resultText}\`);
-
       grabbedAccounts.push(acc.email);
       saveGrabbed();
       renderAccounts();
@@ -412,7 +420,6 @@ const HTML = `<!DOCTYPE html>
     if (grabInterval) clearInterval(grabInterval);
     const select = document.getElementById('selectedAccount');
     if (!select.value) { alert('请选择账号'); return; }
-
     document.getElementById('grabStatus').innerHTML = '<span class="status running">正在抢号中...</span>';
     pollOnce();
     grabInterval = setInterval(pollOnce, 10000);
@@ -422,6 +429,25 @@ const HTML = `<!DOCTYPE html>
     if (grabInterval) clearInterval(grabInterval);
     grabInterval = null;
     document.getElementById('grabStatus').innerHTML = '<span class="status stopped">已停止</span>';
+  }
+
+  // 查看已扫到的号码（去重）
+  function showSeenNumbers() {
+    if (seenNumbersList.length === 0) {
+      alert('还没有扫到任何号码');
+      return;
+    }
+    const list = seenNumbersList.join('\\n');
+    const win = window.open('', '_blank');
+    win.document.write(\`
+      <html>
+        <head><title>已扫到的号码（共 \${seenNumbersList.length} 个）</title></head>
+        <body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">
+          <h3>已扫到的唯一号码（共 \${seenNumbersList.length} 个）</h3>
+          \${list}
+        </body>
+      </html>
+    \`);
   }
 
   function init() {
