@@ -96,14 +96,13 @@ const HTML = `<!DOCTYPE html>
       <div class="card">
         <h3 style="margin:0 0 8px 0;">抢号日志 <span id="scanCount" style="font-size:13px;color:#666;"></span></h3>
         <div id="log" class="log"></div>
-        
+       
         <div style="display:flex; gap:10px; margin-top:10px;">
           <button class="btn secondary" onclick="clearLog()" style="flex:1;">清空日志</button>
           <button class="btn secondary" onclick="showSeenNumbers()" style="flex:1;">查看已扫号码（去重）</button>
         </div>
       </div>
     </div>
-
     <!-- 添加账号页 -->
     <div class="page" id="pageAddAccount">
       <div class="nav">
@@ -123,15 +122,12 @@ const HTML = `<!DOCTYPE html>
       </div>
     </div>
   </div>
-
 <script>
   let accounts = JSON.parse(localStorage.getItem('grabber_accounts') || '[]');
   let grabbedAccounts = JSON.parse(localStorage.getItem('grabbed_accounts') || '[]');
   let grabInterval = null;
   let captchaKey = '';
   let totalScanned = 0;
-
-  // 新增：记录已扫到的号码（去重）
   let seenNumbers = new Set();
   let seenNumbersList = [];
 
@@ -165,16 +161,16 @@ const HTML = `<!DOCTYPE html>
       const isGrabbed = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee;';
-      div.innerHTML = \`
+      div.innerHTML = `
         <div>
-          <strong>\${acc.email}</strong>
-          \${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
+          <strong>${acc.email}</strong>
+          ${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
         </div>
         <div>
-          <button onclick="resetAccount(\${index})" style="padding:4px 10px;font-size:12px;">重置</button>
-          <button onclick="removeAccount(\${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
+          <button onclick="resetAccount(${index})" style="padding:4px 10px;font-size:12px;">重置</button>
+          <button onclick="removeAccount(${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
         </div>
-      \`;
+      `;
       container.appendChild(div);
     });
     updateAccountSelect();
@@ -266,11 +262,11 @@ const HTML = `<!DOCTYPE html>
   function addLog(text) {
     const log = document.getElementById('log');
     const time = new Date().toLocaleTimeString();
-    log.innerHTML = \`<div class="log-item">[\${time}] \${text}</div>\` + log.innerHTML;
+    log.innerHTML = `<div class="log-item">[${time}] ${text}</div>` + log.innerHTML;
   }
 
   function updateScanCount() {
-    document.getElementById('scanCount').textContent = \`共轮询 \${totalScanned} 次\`;
+    document.getElementById('scanCount').textContent = `共轮询 ${totalScanned} 次`;
   }
 
   function clearLog() {
@@ -279,11 +275,9 @@ const HTML = `<!DOCTYPE html>
     updateScanCount();
   }
 
-  // ==================== 正确的匹配逻辑 ====================
   function matchesPattern(last4, pattern) {
     if (!last4 || last4.length !== 4) return false;
     const [a, b, c, d] = last4.split('');
-    
     if (pattern === 'aaaa') return a === b && b === c && c === d;
     if (pattern === 'aaab') return a === b && b === c && c !== d;
     if (pattern === 'abbb') return a !== b && b === c && c === d;
@@ -297,6 +291,18 @@ const HTML = `<!DOCTYPE html>
       const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', { headers: { token } });
       const json = await res.json();
       return json.data?.records?.length > 0;
+    } catch (e) { return false; }
+  }
+
+  // ==================== 新增：校验未支付列表（status=2） ====================
+  async function checkUnpaidNumber(phone, token) {
+    try {
+      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=20&status=2&phone=', { headers: { token } });
+      const json = await res.json();
+      if (json.code === 200 && json.data?.records) {
+        return json.data.records.some(r => r.phoneNumber === phone);
+      }
+      return false;
     } catch (e) { return false; }
   }
 
@@ -327,7 +333,7 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 核心抢号逻辑（已修复） ====================
+  // ==================== 核心抢号逻辑（已按HAR流程修改锁号） ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -336,14 +342,14 @@ const HTML = `<!DOCTYPE html>
     if (!acc) return;
 
     if (grabbedAccounts.includes(acc.email)) {
-      addLog(\`\${acc.email} 已抢过，跳过\`);
+      addLog(`${acc.email} 已抢过，跳过`);
       stopGrab();
       return;
     }
 
     const hasPaid = await checkHasPaidNumber(acc.token);
     if (hasPaid) {
-      addLog(\`\${acc.email} 已有付费CA号，自动锁定\`);
+      addLog(`${acc.email} 已有付费CA号，自动锁定`);
       grabbedAccounts.push(acc.email);
       saveGrabbed();
       renderAccounts();
@@ -361,7 +367,6 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
-      // 记录本次扫到的所有号码（去重）
       numRes.data.forEach(item => {
         if (item.phoneNumber && !seenNumbers.has(item.phoneNumber)) {
           seenNumbers.add(item.phoneNumber);
@@ -375,8 +380,7 @@ const HTML = `<!DOCTYPE html>
 
       for (const item of numRes.data) {
         if (!item.phoneNumber) continue;
-        if (item.buyPrice !== 0.30) continue; // 只买0.3季包
-
+        if (item.buyPrice !== 0.30) continue;
         const last4 = item.phoneNumber.slice(-4);
         for (const pat of patterns) {
           if (matchesPattern(last4, pat)) {
@@ -389,27 +393,37 @@ const HTML = `<!DOCTYPE html>
       }
 
       if (!matchedPhone) {
-        addLog(\`共轮询 \${totalScanned} 次 | 本次无符合条件的号码，跳过\`);
+        addLog(`共轮询 ${totalScanned} 次 | 本次无符合条件的号码，跳过`);
         return;
       }
 
-      addLog(\`发现 \${matchedClass}类 号码 \${matchedPhone}（0.3季包），开始购买...\`);
+      addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始购买...`);
 
       const buyRes = await buyNumber(matchedPhone, acc.token);
-      let resultText = '';
 
       if (buyRes.code === 200 && buyRes.data?.orderNo) {
-        const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
-        resultText = payRes.code === 200 ? '购买成功' : \`付款失败（\${payRes.message || '余额不足'}）→ 已记录为成功\`;
-      } else {
-        resultText = \`占号失败（\${buyRes.message || '未知'}）→ 已记录为成功\`;
-      }
+        addLog(`占号接口返回成功，正在校验未支付列表...`);
 
-      addLog(\`【锁定】\${matchedClass}类 号码 \${matchedPhone} | \${resultText}\`);
-      grabbedAccounts.push(acc.email);
-      saveGrabbed();
-      renderAccounts();
-      stopGrab();
+        // ==================== 关键修改：必须在未支付列表里出现才锁定 ====================
+        const isInUnpaid = await checkUnpaidNumber(matchedPhone, acc.token);
+
+        if (isInUnpaid) {
+          addLog(`【占号成功并已校验】${matchedClass}类 号码 ${matchedPhone}（未支付列表已出现）`);
+
+          try {
+            await confirmPay(buyRes.data.orderNo, acc.token);
+          } catch (e) {}
+
+          grabbedAccounts.push(acc.email);
+          saveGrabbed();
+          renderAccounts();
+          stopGrab();
+        } else {
+          addLog(`【占号后校验失败】${matchedPhone} 未在未支付列表中出现，暂不锁定`);
+        }
+      } else {
+        addLog(`【占号失败】${matchedClass}类 号码 ${matchedPhone} | ${buyRes.message || 'Server Exception'}`);
+      }
 
     } catch (e) {
       addLog('出错: ' + e.message);
@@ -431,30 +445,28 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('grabStatus').innerHTML = '<span class="status stopped">已停止</span>';
   }
 
-  // 查看已扫到的号码（去重）
   function showSeenNumbers() {
     if (seenNumbersList.length === 0) {
       alert('还没有扫到任何号码');
       return;
     }
-    const list = seenNumbersList.join('\\n');
+    const list = seenNumbersList.join('\n');
     const win = window.open('', '_blank');
-    win.document.write(\`
+    win.document.write(`
       <html>
-        <head><title>已扫到的号码（共 \${seenNumbersList.length} 个）</title></head>
+        <head><title>已扫到的号码（共 ${seenNumbersList.length} 个）</title></head>
         <body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">
-          <h3>已扫到的唯一号码（共 \${seenNumbersList.length} 个）</h3>
-          \${list}
+          <h3>已扫到的唯一号码（共 ${seenNumbersList.length} 个）</h3>
+          ${list}
         </body>
       </html>
-    \`);
+    `);
   }
 
   function init() {
     renderAccounts();
     updateScanCount();
   }
-
   init();
 </script>
 </body>
