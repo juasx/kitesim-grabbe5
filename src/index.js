@@ -48,14 +48,20 @@ export class GrabberDO extends DurableObject {
       return json({ error: "缺少 email 或 token" }, 400);
     }
 
+    // 保留历史成功记录
+    const old = (await this.ctx.storage.get("state")) || {};
+    const history = old.history || [];
+
     const state = {
       email,
       token,
       patterns: patterns || ["aaab", "abbb", "aaaa", "abab", "abba"],
       isRunning: true,
-      totalScanned: 0,
-      lastPhone: null,
-      lastOrderNo: null,
+      totalScanned: old.totalScanned || 0,
+      lastPhone: old.lastPhone || null,
+      lastOrderNo: old.lastOrderNo || null,
+      pauseUntil: 0,
+      history,
       startedAt: Date.now(),
     };
 
@@ -80,12 +86,18 @@ export class GrabberDO extends DurableObject {
   async getStatus() {
     const state = (await this.ctx.storage.get("state")) || { isRunning: false };
     const logs = (await this.ctx.storage.get("logs")) || [];
+    const now = Date.now();
+    const pauseUntil = state.pauseUntil || 0;
+    const isPaused = pauseUntil > now;
     return json({
       isRunning: !!state.isRunning,
+      isPaused,
+      pauseUntil,
       email: state.email || null,
       totalScanned: state.totalScanned || 0,
       lastPhone: state.lastPhone || null,
       lastOrderNo: state.lastOrderNo || null,
+      history: state.history || [],
       logs: logs.slice(-40),
     });
   }
@@ -93,6 +105,28 @@ export class GrabberDO extends DurableObject {
   async alarm() {
     const state = await this.ctx.storage.get("state");
     if (!state || !state.isRunning) return;
+
+    const now = Date.now();
+    // 还在暂停期
+    if (state.pauseUntil && state.pauseUntil > now) {
+      const leftMin = Math.ceil((state.pauseUntil - now) / 60000);
+      // 每分钟打一次日志提示
+      if (!state.lastPauseLog || now - state.lastPauseLog > 55000) {
+        await this.addLog(`暂停中，约 ${leftMin} 分钟后恢复抢号...`);
+        state.lastPauseLog = now;
+        await this.ctx.storage.put("state", state);
+      }
+      // 精确约到暂停结束
+      await this.ctx.storage.setAlarm(Math.min(state.pauseUntil, now + 60000));
+      return;
+    }
+
+    // 暂停刚结束
+    if (state.pauseUntil && state.pauseUntil <= now) {
+      state.pauseUntil = 0;
+      await this.ctx.storage.put("state", state);
+      await this.addLog("暂停结束，恢复抢号");
+    }
 
     try {
       await this.pollOnce();
@@ -102,7 +136,12 @@ export class GrabberDO extends DurableObject {
 
     const latest = await this.ctx.storage.get("state");
     if (latest && latest.isRunning) {
-      await this.ctx.storage.setAlarm(Date.now() + 10000);
+      // 如果刚成功进入暂停，约到暂停结束；否则 10 秒后
+      if (latest.pauseUntil && latest.pauseUntil > Date.now()) {
+        await this.ctx.storage.setAlarm(Math.min(latest.pauseUntil, Date.now() + 60000));
+      } else {
+        await this.ctx.storage.setAlarm(Date.now() + 10000);
+      }
     }
   }
 
@@ -114,10 +153,10 @@ export class GrabberDO extends DurableObject {
 
     const hasPaid = await this.checkHasPaidNumber(token);
     if (hasPaid) {
-      await this.addLog(`${email} 已有未支付CA号，自动锁定并停止`);
-      state.isRunning = false;
+      // 已有待支付订单，暂停 30 分钟再试（给用户时间处理订单）
+      state.pauseUntil = Date.now() + 30 * 60 * 1000;
       await this.ctx.storage.put("state", state);
-      await this.ctx.storage.deleteAlarm();
+      await this.addLog(`${email} 已有未支付订单，暂停 30 分钟后再试`);
       return;
     }
 
@@ -159,14 +198,23 @@ export class GrabberDO extends DurableObject {
       return;
     }
 
-    // 返回订单号 = 成功
+    // 返回订单号 = 成功 → 记录历史，暂停 30 分钟后自动恢复
     state.lastPhone = matchedPhone;
     state.lastOrderNo = buyRes.data.orderNo;
-    state.isRunning = false;
+    state.pauseUntil = Date.now() + 30 * 60 * 1000; // 30 分钟
+    state.history = state.history || [];
+    state.history.push({
+      phone: matchedPhone,
+      orderNo: buyRes.data.orderNo,
+      class: matchedClass,
+      time: new Date().toLocaleString("zh-CN", { hour12: false }),
+    });
+    // 只保留最近 20 条历史
+    if (state.history.length > 20) state.history = state.history.slice(-20);
     await this.ctx.storage.put("state", state);
-    await this.ctx.storage.deleteAlarm();
 
-    await this.addLog(`【成功锁定】${matchedClass}类 ${matchedPhone} | 订单号 ${buyRes.data.orderNo}`);
+    await this.addLog(`【成功】${matchedClass}类 ${matchedPhone} | 订单号 ${buyRes.data.orderNo}`);
+    await this.addLog(`已暂停 30 分钟，之后自动恢复抢号`);
 
     try {
       const payRes = await this.confirmPay(buyRes.data.orderNo, token);
@@ -301,19 +349,19 @@ export default {
 
     // /grab/<email>/start  /grab/<email>/stop  /grab/<email>/status
     if (url.pathname.startsWith("/grab/")) {
-      const parts = url.pathname.split("/").filter(Boolean);
+      const parts = url.pathname.split("/").filter(Boolean); // ["grab", "email@xx.com", "start"]
       if (parts.length >= 3) {
         const email = decodeURIComponent(parts[1]);
-        const action = parts[2];
+        const action = parts[2]; // start / stop / status / clear-logs
 
-        const id = env.GRABBER.idFromName(email);
+        const id = env.GRABBER.idFromName(email); // 每个邮箱独立实例
         const stub = env.GRABBER.get(id);
 
         const newUrl = new URL(request.url);
         newUrl.pathname = "/" + action;
         return stub.fetch(new Request(newUrl, request));
       }
-      return json({ error: "path error" }, 400);
+      return json({ error: "path error, use /grab/<email>/start|stop|status" }, 400);
     }
 
     // 原有代理
@@ -412,6 +460,7 @@ const HTML = `<!DOCTYPE html>
         <label>要匹配的类（逗号分隔）</label>
         <input id="patterns" value="aaab, abbb, aaaa, abab, abba">
         <div class="tip">只购买 0.3 季包</div>
+        <div id="historyBox" style="margin-top:12px;font-size:13px;"></div>
       </div>
 
       <div class="card">
@@ -449,7 +498,7 @@ const HTML = `<!DOCTYPE html>
   let captchaKey = '';
   let currentViewEmail = null;
   let statusTimer = null;
-  let statusMap = {};
+  let statusMap = {}; // email -> status
 
   function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
 
@@ -484,7 +533,10 @@ const HTML = `<!DOCTYPE html>
       const lastPhone = st.lastPhone;
 
       let statusHtml = '';
-      if (lastPhone) {
+      if (st.isPaused) {
+        const left = st.pauseUntil ? Math.ceil((st.pauseUntil - Date.now()) / 60000) : 30;
+        statusHtml = '<span class="status success">暂停中 · ' + left + '分钟后恢复</span>';
+      } else if (lastPhone && !isRunning) {
         statusHtml = '<span class="status success">已占到 ' + lastPhone + '</span>';
       } else if (isRunning) {
         statusHtml = '<span class="status running">运行中 · ' + (st.totalScanned || 0) + '次</span>';
@@ -494,14 +546,17 @@ const HTML = `<!DOCTYPE html>
 
       const div = document.createElement('div');
       div.className = 'acc-row';
-      div.innerHTML = '<div class="acc-info" onclick="viewLogs(\\'' + acc.email + '\\')" style="cursor:pointer;">' +
-        '<div class="acc-email">' + acc.email + '</div>' +
-        '<div class="acc-meta">' + statusHtml + '</div></div>' +
-        '<div class="acc-actions">' +
-        '<button class="btn small" ' + (isRunning ? 'disabled' : '') + ' onclick="startOne(\\'' + acc.email + '\\')">开始</button>' +
-        '<button class="btn secondary small" onclick="stopOne(\\'' + acc.email + '\\')">停止</button>' +
-        '<button class="btn secondary small" style="color:#c8102e;" onclick="removeAccount(' + index + ')">删</button>' +
-        '</div>';
+      div.innerHTML = \`
+        <div class="acc-info" onclick="viewLogs('\${acc.email}')" style="cursor:pointer;">
+          <div class="acc-email">\${acc.email}</div>
+          <div class="acc-meta">\${statusHtml}</div>
+        </div>
+        <div class="acc-actions">
+          <button class="btn small" \${isRunning ? 'disabled' : ''} onclick="startOne('\${acc.email}')">开始</button>
+          <button class="btn secondary small" onclick="stopOne('\${acc.email}')">停止</button>
+          <button class="btn secondary small" style="color:#c8102e;" onclick="removeAccount(\${index})">删</button>
+        </div>
+      \`;
       container.appendChild(div);
     });
   }
@@ -561,6 +616,7 @@ const HTML = `<!DOCTYPE html>
   function removeAccount(index) {
     if (!confirm('确定删除？')) return;
     const email = accounts[index].email;
+    // 先尝试停止
     fetch('/grab/' + encodeURIComponent(email) + '/stop', { method: 'POST' }).catch(() => {});
     accounts.splice(index, 1);
     saveAccounts();
@@ -629,6 +685,7 @@ const HTML = `<!DOCTYPE html>
         } else {
           logEl.innerHTML = '<div style="color:#888;">暂无日志</div>';
         }
+        renderHistory(data.history || []);
       }
     } catch (e) {
       console.error(e);
@@ -646,6 +703,22 @@ const HTML = `<!DOCTYPE html>
     if (!currentViewEmail) return;
     await fetch('/grab/' + encodeURIComponent(currentViewEmail) + '/clear-logs', { method: 'POST' });
     document.getElementById('log').innerHTML = '';
+  }
+
+  function renderHistory(history) {
+    const box = document.getElementById('historyBox');
+    if (!box) return;
+    if (!history || history.length === 0) {
+      box.innerHTML = '<div style="color:#888;">暂无历史占号记录</div>';
+      return;
+    }
+    let html = '<div style="font-weight:600;margin-bottom:6px;">历史占成功号码：</div>';
+    history.slice().reverse().forEach(function(h) {
+      html += '<div style="padding:4px 0;border-bottom:1px solid #eee;">' +
+        (h.class || '') + ' ' + h.phone +
+        ' <span style="color:#888;font-size:11px;">' + (h.time || '') + '</span></div>';
+    });
+    box.innerHTML = html;
   }
 
   function startAutoRefresh() {
