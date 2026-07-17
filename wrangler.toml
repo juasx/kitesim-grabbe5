@@ -1,4 +1,4 @@
-name = "kitesim-grabber"
+name = "kitesim-grabbe5"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
 
@@ -8,4 +8,4 @@ class_name = "GrabberDO"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["GrabberDO"]
+new_sqlite_classes = ["GrabberDO"]
