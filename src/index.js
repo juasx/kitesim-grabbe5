@@ -337,7 +337,7 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 核心抢号逻辑（已按抓包步调修复：成功以 status=1 未支付订单记录为准） ====================
+  // ==================== 核心抢号逻辑 ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -406,35 +406,33 @@ const HTML = `<!DOCTYPE html>
 
       addLog(\`发现 \${matchedClass}类 号码 \${matchedPhone}（0.3季包），开始占号...\`);
 
-      // 第三步：占号（buy）
+      // 第三步：占号（buy）——只要返回订单号就算占成功
       const buyRes = await buyNumber(matchedPhone, acc.token);
       if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
         addLog(\`占号失败（\${buyRes.message || '未知'}），继续轮询...\`);
         return; // 不锁定，继续尝试
       }
 
-      addLog(\`占号成功，订单号 \${buyRes.data.orderNo}，开始确认支付...\`);
+      // ★ 关键：返回订单号 = 占成功，直接锁定账号（不再依赖 status=1 校验）
+      addLog(\`【成功锁定】\${matchedClass}类 号码 \${matchedPhone} | 订单号 \${buyRes.data.orderNo}\`);
 
-      // 第四步：确认支付（confirmPay）
-      const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
-      if (payRes.code !== 200) {
-        addLog(\`确认支付返回失败（\${payRes.message || '未知'}），但已尝试\`);
+      // 尝试确认支付（即使余额不足也不影响锁定）
+      try {
+        const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
+        if (payRes.code === 200) {
+          addLog(\`确认支付成功\`);
+        } else {
+          addLog(\`确认支付返回（\${payRes.message || '未知'}），订单已生成，账号已锁定\`);
+        }
+      } catch (e) {
+        addLog(\`确认支付请求异常，但订单已生成，账号已锁定\`);
       }
 
-      // 第五步：关键校验！重新检查未支付订单列表（status=1），只有出现记录才算真正占成功
-      await new Promise(resolve => setTimeout(resolve, 1800)); // 等待后端同步
-      const hasPaidAfter = await checkHasPaidNumber(acc.token);
-
-      if (hasPaidAfter) {
-        addLog(\`【成功锁定】\${matchedClass}类 号码 \${matchedPhone} | 未支付订单已生成，账号锁定\`);
-        grabbedAccounts.push(acc.email);
-        saveGrabbed();
-        renderAccounts();
-        stopGrab();
-      } else {
-        addLog(\`校验失败：未支付订单列表仍为空，占号可能未生效或失败，继续轮询尝试...\`);
-        // 不锁定账号，继续下一次 poll
-      }
+      // 锁定账号，停止轮询
+      grabbedAccounts.push(acc.email);
+      saveGrabbed();
+      renderAccounts();
+      stopGrab();
 
     } catch (e) {
       addLog('出错: ' + e.message);
