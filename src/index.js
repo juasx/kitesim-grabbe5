@@ -1,6 +1,310 @@
+import { DurableObject } from "cloudflare:workers";
+
+// ==================== Durable Object：真正后台抢号 ====================
+export class GrabberDO extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
+    }
+
+    try {
+      if (path === "/start" && request.method === "POST") {
+        const body = await request.json();
+        return await this.startGrab(body);
+      }
+      if (path === "/stop" && request.method === "POST") {
+        return await this.stopGrab();
+      }
+      if (path === "/status") {
+        return await this.getStatus();
+      }
+      if (path === "/logs") {
+        return await this.getLogs();
+      }
+      if (path === "/clear-logs" && request.method === "POST") {
+        await this.ctx.storage.put("logs", []);
+        return json({ ok: true });
+      }
+      return json({ error: "not found" }, 404);
+    } catch (e) {
+      return json({ error: e.message }, 500);
+    }
+  }
+
+  async startGrab({ email, token, patterns }) {
+    if (!email || !token) {
+      return json({ error: "缺少 email 或 token" }, 400);
+    }
+
+    const state = {
+      email,
+      token,
+      patterns: patterns || ["aaab", "abbb", "aaaa", "abab", "abba"],
+      isRunning: true,
+      totalScanned: 0,
+      lastPhone: null,
+      lastOrderNo: null,
+      startedAt: Date.now(),
+    };
+
+    await this.ctx.storage.put("state", state);
+    await this.addLog(`开始抢号：${email} | 匹配类：${state.patterns.join(",")}`);
+
+    // 立刻跑一次 + 设置 10 秒后的闹钟
+    await this.pollOnce();
+    await this.ctx.storage.setAlarm(Date.now() + 10000);
+
+    return json({ ok: true, message: "已启动后台抢号" });
+  }
+
+  async stopGrab() {
+    const state = (await this.ctx.storage.get("state")) || {};
+    state.isRunning = false;
+    await this.ctx.storage.put("state", state);
+    await this.ctx.storage.deleteAlarm();
+    await this.addLog("已停止抢号");
+    return json({ ok: true });
+  }
+
+  async getStatus() {
+    const state = (await this.ctx.storage.get("state")) || { isRunning: false };
+    const logs = (await this.ctx.storage.get("logs")) || [];
+    return json({
+      isRunning: !!state.isRunning,
+      email: state.email || null,
+      totalScanned: state.totalScanned || 0,
+      lastPhone: state.lastPhone || null,
+      lastOrderNo: state.lastOrderNo || null,
+      logs: logs.slice(-50),
+    });
+  }
+
+  async getLogs() {
+    const logs = (await this.ctx.storage.get("logs")) || [];
+    return json({ logs });
+  }
+
+  // 每 10 秒自动执行
+  async alarm() {
+    const state = await this.ctx.storage.get("state");
+    if (!state || !state.isRunning) return;
+
+    try {
+      await this.pollOnce();
+    } catch (e) {
+      await this.addLog("轮询出错: " + e.message);
+    }
+
+    // 还在运行就继续约下一次
+    const latest = await this.ctx.storage.get("state");
+    if (latest && latest.isRunning) {
+      await this.ctx.storage.setAlarm(Date.now() + 10000);
+    }
+  }
+
+  async pollOnce() {
+    const state = await this.ctx.storage.get("state");
+    if (!state || !state.isRunning) return;
+
+    const { token, email, patterns } = state;
+
+    // 1. 检查是否已有未支付订单
+    const hasPaid = await this.checkHasPaidNumber(token);
+    if (hasPaid) {
+      await this.addLog(`${email} 已有未支付CA号，自动锁定并停止`);
+      state.isRunning = false;
+      await this.ctx.storage.put("state", state);
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    // 2. 拉号码
+    const numRes = await this.getNewNumber(token);
+    state.totalScanned = (state.totalScanned || 0) + 1;
+    await this.ctx.storage.put("state", state);
+
+    if (numRes.code !== 200 || !Array.isArray(numRes.data) || numRes.data.length === 0) {
+      await this.addLog(`第 ${state.totalScanned} 次 | 获取号码失败`);
+      return;
+    }
+
+    // 3. 找匹配号码
+    let matchedPhone = null;
+    let matchedClass = "";
+
+    for (const item of numRes.data) {
+      if (!item.phoneNumber || item.buyPrice !== 0.3) continue;
+      const last4 = item.phoneNumber.slice(-4);
+      for (const pat of patterns) {
+        if (this.matchesPattern(last4, pat)) {
+          matchedPhone = item.phoneNumber;
+          matchedClass = pat;
+          break;
+        }
+      }
+      if (matchedPhone) break;
+    }
+
+    if (!matchedPhone) {
+      await this.addLog(`第 ${state.totalScanned} 次 | 无符合条件号码`);
+      return;
+    }
+
+    await this.addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始占号...`);
+
+    // 4. 占号
+    const buyRes = await this.buyNumber(matchedPhone, token);
+    if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
+      await this.addLog(`占号失败（${buyRes.message || "未知"}），继续轮询...`);
+      return;
+    }
+
+    // ★ 返回订单号 = 成功，立刻锁定
+    state.lastPhone = matchedPhone;
+    state.lastOrderNo = buyRes.data.orderNo;
+    state.isRunning = false;
+    await this.ctx.storage.put("state", state);
+    await this.ctx.storage.deleteAlarm();
+
+    await this.addLog(`【成功锁定】${matchedClass}类 ${matchedPhone} | 订单号 ${buyRes.data.orderNo}`);
+
+    // 尝试确认支付（余额不足也不影响）
+    try {
+      const payRes = await this.confirmPay(buyRes.data.orderNo, token);
+      if (payRes.code === 200) {
+        await this.addLog("确认支付成功");
+      } else {
+        await this.addLog(`确认支付返回（${payRes.message || "未知"}），订单已生成`);
+      }
+    } catch (e) {
+      await this.addLog("确认支付异常，但订单已生成");
+    }
+  }
+
+  matchesPattern(last4, pattern) {
+    if (!last4 || last4.length !== 4) return false;
+    const [a, b, c, d] = last4.split("");
+    if (pattern === "aaaa") return a === b && b === c && c === d;
+    if (pattern === "aaab") return a === b && b === c && c !== d;
+    if (pattern === "abbb") return a !== b && b === c && c === d;
+    if (pattern === "abab") return a === c && b === d && a !== b;
+    if (pattern === "abba") return a === d && b === c && a !== b;
+    return false;
+  }
+
+  async checkHasPaidNumber(token) {
+    try {
+      const res = await fetch(
+        "https://api.kitesim.co/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=",
+        {
+          headers: {
+            token,
+            Origin: "https://h5.kitesim.co",
+            Referer: "https://h5.kitesim.co/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+          },
+        }
+      );
+      const data = await res.json();
+      return data.data?.records?.length > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async getNewNumber(token) {
+    const res = await fetch("https://api.kitesim.co/countryCode/getPhoneNumber/CA", {
+      headers: {
+        token,
+        Origin: "https://h5.kitesim.co",
+        Referer: "https://h5.kitesim.co/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+      },
+    });
+    return await res.json();
+  }
+
+  async buyNumber(phoneNumber, token) {
+    try {
+      const res = await fetch("https://api.kitesim.co/userPhonePurchase/buyPhoneNumberOrder", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          token,
+          Origin: "https://h5.kitesim.co",
+          Referer: "https://h5.kitesim.co/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        },
+        body: JSON.stringify({
+          autoRenew: 0,
+          countryCode: "CA",
+          couponId: null,
+          couponType: null,
+          isSelected: 0,
+          packageId: "1958014808238002177",
+          phoneNumber,
+          serviceId: "",
+          type: 1,
+        }),
+      });
+      return await res.json();
+    } catch (e) {
+      return { code: 0, message: e.message };
+    }
+  }
+
+  async confirmPay(orderNo, token) {
+    try {
+      const res = await fetch("https://api.kitesim.co/userPhonePurchase/confirmPay", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          token,
+          Origin: "https://h5.kitesim.co",
+          Referer: "https://h5.kitesim.co/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        },
+        body: JSON.stringify({
+          paymentMethod: 1,
+          payChannel: "1",
+          orderNo,
+        }),
+      });
+      return await res.json();
+    } catch (e) {
+      return { code: 0, message: e.message };
+    }
+  }
+
+  async addLog(text) {
+    const logs = (await this.ctx.storage.get("logs")) || [];
+    const time = new Date().toLocaleString("zh-CN", { hour12: false });
+    logs.push(`[${time}] ${text}`);
+    if (logs.length > 100) logs.splice(0, logs.length - 100);
+    await this.ctx.storage.put("logs", logs);
+  }
+}
+
+// ==================== 主 Worker ====================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -10,12 +314,23 @@ export default {
         },
       });
     }
+
+    // 后台抢号接口 → Durable Object
+    if (url.pathname.startsWith("/grab/")) {
+      const id = env.GRABBER.idFromName("main");
+      const stub = env.GRABBER.get(id);
+      const newUrl = new URL(request.url);
+      newUrl.pathname = url.pathname.replace(/^\/grab/, "") || "/";
+      return stub.fetch(new Request(newUrl, request));
+    }
+
+    // 原有代理（登录、验证码等）
     if (url.pathname.startsWith("/api/")) {
       const targetPath = url.pathname.replace(/^\/api/, "") + url.search;
       const target = "https://api.kitesim.co" + targetPath;
       const headers = {
-        "Origin": "https://h5.kitesim.co",
-        "Referer": "https://h5.kitesim.co/",
+        Origin: "https://h5.kitesim.co",
+        Referer: "https://h5.kitesim.co/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
       };
       const clientToken = request.headers.get("token");
@@ -29,29 +344,45 @@ export default {
       const data = await resp.text();
       return new Response(data, {
         status: resp.status,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
       });
     }
+
     return new Response(HTML, {
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
   },
 };
 
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
+
+// ==================== 前端页面 ====================
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Kite Grabber</title>
+  <title>Kite Grabber（后台版）</title>
   <style>
     body { font-family: system-ui; background: #f5f5f7; margin: 0; padding: 16px; }
     .container { max-width: 720px; margin: 0 auto; }
     .card { background: white; border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .btn { background: #c8102e; color: white; border: none; padding: 12px 18px; border-radius: 12px; font-size: 15px; cursor: pointer; width: 100%; }
     .btn.secondary { background: #f0f0f3; color: #333; }
-    input, select { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 12px; margin-bottom: 12px; font-size: 15px; }
-    .log { background: #f8f9fa; padding: 12px; border-radius: 12px; max-height: 320px; overflow-y: auto; font-size: 13px; line-height: 1.5; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    input, select { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 12px; margin-bottom: 12px; font-size: 15px; box-sizing: border-box; }
+    .log { background: #f8f9fa; padding: 12px; border-radius: 12px; max-height: 360px; overflow-y: auto; font-size: 13px; line-height: 1.5; }
     .log-item { padding: 5px 0; border-bottom: 1px solid #eee; }
     .status { font-size: 13px; padding: 6px 12px; border-radius: 20px; display: inline-block; }
     .status.running { background: #d4edda; color: #155724; }
@@ -60,49 +391,51 @@ const HTML = `<!DOCTYPE html>
     .page.active { display: block; }
     .nav { display: flex; align-items: center; margin-bottom: 16px; }
     .nav-title { font-size: 20px; font-weight: 700; flex: 1; }
+    .tip { font-size: 13px; color: #666; margin-top: 8px; line-height: 1.5; }
   </style>
 </head>
 <body>
   <div class="container">
-    <!-- 主页 -->
     <div class="page active" id="pageMain">
       <div class="nav">
-        <div class="nav-title">Kite Grabber</div>
+        <div class="nav-title">Kite Grabber（后台版）</div>
         <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goAddAccount()">添加账号</button>
       </div>
+
       <div class="card">
         <h3 style="margin:0 0 12px 0;">已添加账号</h3>
         <div id="accountList"></div>
       </div>
+
       <div class="card">
-        <h3 style="margin:0 0 12px 0;">抢号设置</h3>
+        <h3 style="margin:0 0 12px 0;">后台抢号</h3>
         <div>
           <label>选择账号</label>
           <select id="selectedAccount"></select>
         </div>
         <div style="margin-top:12px;">
-          <label>要匹配的类（aaab, abbb, aaaa, abab, abba）</label>
+          <label>要匹配的类（逗号分隔）</label>
           <input id="patterns" value="aaab, abbb, aaaa, abab, abba">
         </div>
-        <div style="margin-top:8px; font-size:13px; color:#666;">
-          只购买季包 0.3 的号码
-        </div>
+        <div class="tip">只购买 0.3 季包。点击「开始后台抢号」后，关闭浏览器/手机锁屏也会继续跑。</div>
         <div style="margin-top:16px; display:flex; gap:10px;">
-          <button class="btn" onclick="startGrab()">开始抢号（每10秒）</button>
-          <button class="btn secondary" onclick="stopGrab()">停止</button>
+          <button class="btn" id="btnStart" onclick="startGrab()">开始后台抢号</button>
+          <button class="btn secondary" id="btnStop" onclick="stopGrab()">停止</button>
         </div>
         <div id="grabStatus" style="margin-top:12px;"></div>
+        <div id="lastResult" style="margin-top:8px;font-size:14px;color:#333;"></div>
       </div>
+
       <div class="card">
         <h3 style="margin:0 0 8px 0;">抢号日志 <span id="scanCount" style="font-size:13px;color:#666;"></span></h3>
         <div id="log" class="log"></div>
         <div style="display:flex; gap:10px; margin-top:10px;">
-          <button class="btn secondary" onclick="clearLog()" style="flex:1;">清空日志</button>
-          <button class="btn secondary" onclick="showSeenNumbers()" style="flex:1;">查看已扫号码（去重）</button>
+          <button class="btn secondary" onclick="refreshStatus()" style="flex:1;">刷新状态</button>
+          <button class="btn secondary" onclick="clearLogs()" style="flex:1;">清空日志</button>
         </div>
       </div>
     </div>
-    <!-- 添加账号页 -->
+
     <div class="page" id="pageAddAccount">
       <div class="nav">
         <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goMain()">返回</button>
@@ -121,17 +454,13 @@ const HTML = `<!DOCTYPE html>
       </div>
     </div>
   </div>
+
 <script>
   let accounts = JSON.parse(localStorage.getItem('grabber_accounts') || '[]');
-  let grabbedAccounts = JSON.parse(localStorage.getItem('grabbed_accounts') || '[]');
-  let grabInterval = null;
   let captchaKey = '';
-  let totalScanned = 0;
-  let seenNumbers = new Set();
-  let seenNumbersList = [];
+  let statusTimer = null;
 
   function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
-  function saveGrabbed() { localStorage.setItem('grabbed_accounts', JSON.stringify(grabbedAccounts)); }
 
   function showPage(id) {
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -141,6 +470,7 @@ const HTML = `<!DOCTYPE html>
   function goMain() {
     showPage('pageMain');
     renderAccounts();
+    refreshStatus();
   }
 
   function goAddAccount() {
@@ -157,16 +487,11 @@ const HTML = `<!DOCTYPE html>
       return;
     }
     accounts.forEach((acc, index) => {
-      const isGrabbed = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee;';
       div.innerHTML = \`
+        <div><strong>\${acc.email}</strong></div>
         <div>
-          <strong>\${acc.email}</strong>
-          \${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
-        </div>
-        <div>
-          <button onclick="resetAccount(\${index})" style="padding:4px 10px;font-size:12px;">重置</button>
           <button onclick="removeAccount(\${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
         </div>
       \`;
@@ -179,12 +504,10 @@ const HTML = `<!DOCTYPE html>
     const select = document.getElementById('selectedAccount');
     select.innerHTML = '';
     accounts.forEach((acc, index) => {
-      if (!grabbedAccounts.includes(acc.email)) {
-        const opt = document.createElement('option');
-        opt.value = index;
-        opt.textContent = acc.email;
-        select.appendChild(opt);
-      }
+      const opt = document.createElement('option');
+      opt.value = index;
+      opt.textContent = acc.email;
+      select.appendChild(opt);
     });
   }
 
@@ -242,240 +565,104 @@ const HTML = `<!DOCTYPE html>
 
   function removeAccount(index) {
     if (!confirm('确定删除？')) return;
-    const email = accounts[index].email;
     accounts.splice(index, 1);
-    grabbedAccounts = grabbedAccounts.filter(e => e !== email);
     saveAccounts();
-    saveGrabbed();
     renderAccounts();
   }
 
-  function resetAccount(index) {
-    const email = accounts[index].email;
-    grabbedAccounts = grabbedAccounts.filter(e => e !== email);
-    saveGrabbed();
-    renderAccounts();
-    alert('已重置');
-  }
-
-  function addLog(text) {
-    const log = document.getElementById('log');
-    const time = new Date().toLocaleTimeString();
-    log.innerHTML = \`<div class="log-item">[\${time}] \${text}</div>\` + log.innerHTML;
-  }
-
-  function updateScanCount() {
-    document.getElementById('scanCount').textContent = \`共轮询 \${totalScanned} 次\`;
-  }
-
-  function clearLog() {
-    document.getElementById('log').innerHTML = '';
-    totalScanned = 0;
-    updateScanCount();
-  }
-
-  // ==================== 正确的匹配逻辑 ====================
-  function matchesPattern(last4, pattern) {
-    if (!last4 || last4.length !== 4) return false;
-    const [a, b, c, d] = last4.split('');
-    if (pattern === 'aaaa') return a === b && b === c && c === d;
-    if (pattern === 'aaab') return a === b && b === c && c !== d;
-    if (pattern === 'abbb') return a !== b && b === c && c === d;
-    if (pattern === 'abab') return a === c && b === d && a !== b;
-    if (pattern === 'abba') return a === d && b === c && a !== b;
-    return false;
-  }
-
-  async function checkHasPaidNumber(token) {
-    try {
-      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=', { headers: { token } });
-      const json = await res.json();
-      return json.data?.records?.length > 0;
-    } catch (e) { return false; }
-  }
-
-  async function getNewNumber(token) {
-    const res = await fetch('/api/countryCode/getPhoneNumber/CA', { headers: { token } });
-    return await res.json();
-  }
-
-  async function buyNumber(phoneNumber, token) {
-    try {
-      // 完整参数按官方 h5.kitesim.co 抓包（必须带 packageId 等字段，否则后端返回 Server Exception）
-      const res = await fetch('/api/userPhonePurchase/buyPhoneNumberOrder', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', token },
-        body: JSON.stringify({
-          autoRenew: 0,
-          countryCode: 'CA',
-          couponId: null,
-          couponType: null,
-          isSelected: 0,
-          packageId: '1958014808238002177', // 0.30 季包固定ID
-          phoneNumber: phoneNumber,
-          serviceId: '',
-          type: 1
-        })
-      });
-      return await res.json();
-    } catch (e) { return { code: 0, message: e.message }; }
-  }
-
-  async function confirmPay(orderNo, token) {
-    try {
-      // 按官方抓包补全 paymentMethod + payChannel
-      const res = await fetch('/api/userPhonePurchase/confirmPay', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', token },
-        body: JSON.stringify({
-          paymentMethod: 1,
-          payChannel: '1',
-          orderNo: orderNo
-        })
-      });
-      return await res.json();
-    } catch (e) { return { code: 0, message: e.message }; }
-  }
-
-  // ==================== 核心抢号逻辑 ====================
-  async function pollOnce() {
+  async function startGrab() {
     const select = document.getElementById('selectedAccount');
-    if (!select.value) return;
-    const index = parseInt(select.value);
-    const acc = accounts[index];
+    if (!select.value) { alert('请先选择账号'); return; }
+    const acc = accounts[parseInt(select.value)];
     if (!acc) return;
 
-    if (grabbedAccounts.includes(acc.email)) {
-      addLog(\`\${acc.email} 已抢过，跳过\`);
-      stopGrab();
-      return;
-    }
+    const patterns = document.getElementById('patterns').value
+      .split(',')
+      .map(p => p.trim())
+      .filter(Boolean);
 
-    // 第一步：检查是否已有未支付订单（status=1）
-    const hasPaid = await checkHasPaidNumber(acc.token);
-    if (hasPaid) {
-      addLog(\`\${acc.email} 已有未支付CA号，自动锁定\`);
-      grabbedAccounts.push(acc.email);
-      saveGrabbed();
-      renderAccounts();
-      stopGrab();
-      return;
-    }
-
-    // 第二步：获取新号码列表
+    document.getElementById('btnStart').disabled = true;
     try {
-      const numRes = await getNewNumber(acc.token);
-      totalScanned++;
-      updateScanCount();
-
-      if (numRes.code !== 200 || !Array.isArray(numRes.data) || numRes.data.length === 0) {
-        addLog('获取号码失败');
-        return;
-      }
-
-      // 记录本次扫到的所有号码（去重）
-      numRes.data.forEach(item => {
-        if (item.phoneNumber && !seenNumbers.has(item.phoneNumber)) {
-          seenNumbers.add(item.phoneNumber);
-          seenNumbersList.push(item.phoneNumber);
-        }
+      const res = await fetch('/grab/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: acc.email,
+          token: acc.token,
+          patterns
+        })
       });
-
-      const patterns = document.getElementById('patterns').value.split(',').map(p => p.trim());
-      let matchedPhone = null;
-      let matchedClass = '';
-
-      for (const item of numRes.data) {
-        if (!item.phoneNumber) continue;
-        if (item.buyPrice !== 0.30) continue; // 只买0.3季包
-        const last4 = item.phoneNumber.slice(-4);
-        for (const pat of patterns) {
-          if (matchesPattern(last4, pat)) {
-            matchedPhone = item.phoneNumber;
-            matchedClass = pat;
-            break;
-          }
-        }
-        if (matchedPhone) break;
+      const json = await res.json();
+      if (json.ok) {
+        alert('已启动后台抢号！现在可以关闭浏览器了');
+        refreshStatus();
+        startAutoRefresh();
+      } else {
+        alert(json.error || '启动失败');
       }
-
-      if (!matchedPhone) {
-        addLog(\`共轮询 \${totalScanned} 次 | 本次无符合条件的号码，跳过\`);
-        return;
-      }
-
-      addLog(\`发现 \${matchedClass}类 号码 \${matchedPhone}（0.3季包），开始占号...\`);
-
-      // 第三步：占号（buy）——只要返回订单号就算占成功
-      const buyRes = await buyNumber(matchedPhone, acc.token);
-      if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
-        addLog(\`占号失败（\${buyRes.message || '未知'}），继续轮询...\`);
-        return; // 不锁定，继续尝试
-      }
-
-      // ★ 关键：返回订单号 = 占成功，直接锁定账号（不再依赖 status=1 校验）
-      addLog(\`【成功锁定】\${matchedClass}类 号码 \${matchedPhone} | 订单号 \${buyRes.data.orderNo}\`);
-
-      // 尝试确认支付（即使余额不足也不影响锁定）
-      try {
-        const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
-        if (payRes.code === 200) {
-          addLog(\`确认支付成功\`);
-        } else {
-          addLog(\`确认支付返回（\${payRes.message || '未知'}），订单已生成，账号已锁定\`);
-        }
-      } catch (e) {
-        addLog(\`确认支付请求异常，但订单已生成，账号已锁定\`);
-      }
-
-      // 锁定账号，停止轮询
-      grabbedAccounts.push(acc.email);
-      saveGrabbed();
-      renderAccounts();
-      stopGrab();
-
     } catch (e) {
-      addLog('出错: ' + e.message);
+      alert('请求失败: ' + e.message);
+    }
+    document.getElementById('btnStart').disabled = false;
+  }
+
+  async function stopGrab() {
+    try {
+      await fetch('/grab/stop', { method: 'POST' });
+      refreshStatus();
+    } catch (e) {
+      alert('停止失败');
     }
   }
 
-  function startGrab() {
-    if (grabInterval) clearInterval(grabInterval);
-    const select = document.getElementById('selectedAccount');
-    if (!select.value) { alert('请选择账号'); return; }
-    document.getElementById('grabStatus').innerHTML = '<span class="status running">正在抢号中...</span>';
-    pollOnce();
-    grabInterval = setInterval(pollOnce, 10000);
-  }
+  async function refreshStatus() {
+    try {
+      const res = await fetch('/grab/status');
+      const data = await res.json();
 
-  function stopGrab() {
-    if (grabInterval) clearInterval(grabInterval);
-    grabInterval = null;
-    document.getElementById('grabStatus').innerHTML = '<span class="status stopped">已停止</span>';
-  }
+      const statusEl = document.getElementById('grabStatus');
+      if (data.isRunning) {
+        statusEl.innerHTML = '<span class="status running">后台运行中...</span>';
+        document.getElementById('btnStart').disabled = true;
+      } else {
+        statusEl.innerHTML = '<span class="status stopped">已停止</span>';
+        document.getElementById('btnStart').disabled = false;
+      }
 
-  // 查看已扫到的号码（去重）
-  function showSeenNumbers() {
-    if (seenNumbersList.length === 0) {
-      alert('还没有扫到任何号码');
-      return;
+      document.getElementById('scanCount').textContent = data.totalScanned
+        ? \`共轮询 \${data.totalScanned} 次\`
+        : '';
+
+      if (data.lastPhone) {
+        document.getElementById('lastResult').innerHTML =
+          \`最近成功：<b>\${data.lastPhone}</b> | 订单号 \${data.lastOrderNo}\`;
+      }
+
+      const logEl = document.getElementById('log');
+      if (data.logs && data.logs.length) {
+        logEl.innerHTML = data.logs.slice().reverse().map(l =>
+          \`<div class="log-item">\${l}</div>\`
+        ).join('');
+      }
+    } catch (e) {
+      console.error(e);
     }
-    const list = seenNumbersList.join('\\n');
-    const win = window.open('', '_blank');
-    win.document.write(\`
-      <html>
-        <head><title>已扫到的号码（共 \${seenNumbersList.length} 个）</title></head>
-        <body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">
-          <h3>已扫到的唯一号码（共 \${seenNumbersList.length} 个）</h3>
-          \${list}
-        </body>
-      </html>
-    \`);
+  }
+
+  async function clearLogs() {
+    await fetch('/grab/clear-logs', { method: 'POST' });
+    document.getElementById('log').innerHTML = '';
+  }
+
+  function startAutoRefresh() {
+    if (statusTimer) clearInterval(statusTimer);
+    statusTimer = setInterval(refreshStatus, 5000);
   }
 
   function init() {
     renderAccounts();
-    updateScanCount();
+    refreshStatus();
+    startAutoRefresh();
   }
 
   init();
