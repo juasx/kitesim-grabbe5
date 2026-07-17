@@ -301,10 +301,21 @@ const HTML = `<!DOCTYPE html>
 
   async function buyNumber(phoneNumber, token) {
     try {
+      // 完整参数按官方 h5.kitesim.co 抓包（必须带 packageId 等字段，否则后端返回 Server Exception）
       const res = await fetch('/api/userPhonePurchase/buyPhoneNumberOrder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', token },
-        body: JSON.stringify({ phoneNumber, countryCode: 'CA' })
+        body: JSON.stringify({
+          autoRenew: 0,
+          countryCode: 'CA',
+          couponId: null,
+          couponType: null,
+          isSelected: 0,
+          packageId: '1958014808238002177', // 0.30 季包固定ID
+          phoneNumber: phoneNumber,
+          serviceId: '',
+          type: 1
+        })
       });
       return await res.json();
     } catch (e) { return { code: 0, message: e.message }; }
@@ -312,10 +323,15 @@ const HTML = `<!DOCTYPE html>
 
   async function confirmPay(orderNo, token) {
     try {
+      // 按官方抓包补全 paymentMethod + payChannel
       const res = await fetch('/api/userPhonePurchase/confirmPay', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', token },
-        body: JSON.stringify({ orderNo })
+        body: JSON.stringify({
+          paymentMethod: 1,
+          payChannel: '1',
+          orderNo: orderNo
+        })
       });
       return await res.json();
     } catch (e) { return { code: 0, message: e.message }; }
