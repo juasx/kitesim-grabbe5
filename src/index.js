@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ==================== Durable Object：真正后台抢号 ====================
+// ==================== Durable Object：每个账号独立实例 ====================
 export class GrabberDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -33,9 +33,6 @@ export class GrabberDO extends DurableObject {
       if (path === "/status") {
         return await this.getStatus();
       }
-      if (path === "/logs") {
-        return await this.getLogs();
-      }
       if (path === "/clear-logs" && request.method === "POST") {
         await this.ctx.storage.put("logs", []);
         return json({ ok: true });
@@ -65,7 +62,6 @@ export class GrabberDO extends DurableObject {
     await this.ctx.storage.put("state", state);
     await this.addLog(`开始抢号：${email} | 匹配类：${state.patterns.join(",")}`);
 
-    // 立刻跑一次 + 设置 10 秒后的闹钟
     await this.pollOnce();
     await this.ctx.storage.setAlarm(Date.now() + 10000);
 
@@ -90,16 +86,10 @@ export class GrabberDO extends DurableObject {
       totalScanned: state.totalScanned || 0,
       lastPhone: state.lastPhone || null,
       lastOrderNo: state.lastOrderNo || null,
-      logs: logs.slice(-50),
+      logs: logs.slice(-40),
     });
   }
 
-  async getLogs() {
-    const logs = (await this.ctx.storage.get("logs")) || [];
-    return json({ logs });
-  }
-
-  // 每 10 秒自动执行
   async alarm() {
     const state = await this.ctx.storage.get("state");
     if (!state || !state.isRunning) return;
@@ -110,7 +100,6 @@ export class GrabberDO extends DurableObject {
       await this.addLog("轮询出错: " + e.message);
     }
 
-    // 还在运行就继续约下一次
     const latest = await this.ctx.storage.get("state");
     if (latest && latest.isRunning) {
       await this.ctx.storage.setAlarm(Date.now() + 10000);
@@ -123,7 +112,6 @@ export class GrabberDO extends DurableObject {
 
     const { token, email, patterns } = state;
 
-    // 1. 检查是否已有未支付订单
     const hasPaid = await this.checkHasPaidNumber(token);
     if (hasPaid) {
       await this.addLog(`${email} 已有未支付CA号，自动锁定并停止`);
@@ -133,7 +121,6 @@ export class GrabberDO extends DurableObject {
       return;
     }
 
-    // 2. 拉号码
     const numRes = await this.getNewNumber(token);
     state.totalScanned = (state.totalScanned || 0) + 1;
     await this.ctx.storage.put("state", state);
@@ -143,7 +130,6 @@ export class GrabberDO extends DurableObject {
       return;
     }
 
-    // 3. 找匹配号码
     let matchedPhone = null;
     let matchedClass = "";
 
@@ -167,14 +153,13 @@ export class GrabberDO extends DurableObject {
 
     await this.addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始占号...`);
 
-    // 4. 占号
     const buyRes = await this.buyNumber(matchedPhone, token);
     if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
       await this.addLog(`占号失败（${buyRes.message || "未知"}），继续轮询...`);
       return;
     }
 
-    // ★ 返回订单号 = 成功，立刻锁定
+    // 返回订单号 = 成功
     state.lastPhone = matchedPhone;
     state.lastOrderNo = buyRes.data.orderNo;
     state.isRunning = false;
@@ -183,7 +168,6 @@ export class GrabberDO extends DurableObject {
 
     await this.addLog(`【成功锁定】${matchedClass}类 ${matchedPhone} | 订单号 ${buyRes.data.orderNo}`);
 
-    // 尝试确认支付（余额不足也不影响）
     try {
       const payRes = await this.confirmPay(buyRes.data.orderNo, token);
       if (payRes.code === 200) {
@@ -295,7 +279,7 @@ export class GrabberDO extends DurableObject {
     const logs = (await this.ctx.storage.get("logs")) || [];
     const time = new Date().toLocaleString("zh-CN", { hour12: false });
     logs.push(`[${time}] ${text}`);
-    if (logs.length > 100) logs.splice(0, logs.length - 100);
+    if (logs.length > 80) logs.splice(0, logs.length - 80);
     await this.ctx.storage.put("logs", logs);
   }
 }
@@ -315,16 +299,24 @@ export default {
       });
     }
 
-    // 后台抢号接口 → Durable Object
+    // /grab/<email>/start  /grab/<email>/stop  /grab/<email>/status
     if (url.pathname.startsWith("/grab/")) {
-      const id = env.GRABBER.idFromName("main");
-      const stub = env.GRABBER.get(id);
-      const newUrl = new URL(request.url);
-      newUrl.pathname = url.pathname.replace(/^\/grab/, "") || "/";
-      return stub.fetch(new Request(newUrl, request));
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (parts.length >= 3) {
+        const email = decodeURIComponent(parts[1]);
+        const action = parts[2];
+
+        const id = env.GRABBER.idFromName(email);
+        const stub = env.GRABBER.get(id);
+
+        const newUrl = new URL(request.url);
+        newUrl.pathname = "/" + action;
+        return stub.fetch(new Request(newUrl, request));
+      }
+      return json({ error: "path error" }, 400);
     }
 
-    // 原有代理（登录、验证码等）
+    // 原有代理
     if (url.pathname.startsWith("/api/")) {
       const targetPath = url.pathname.replace(/^\/api/, "") + url.search;
       const target = "https://api.kitesim.co" + targetPath;
@@ -367,30 +359,37 @@ function json(data, status = 200) {
   });
 }
 
-// ==================== 前端页面 ====================
+// ==================== 前端（支持多账号并行） ====================
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Kite Grabber（后台版）</title>
+  <title>Kite Grabber（多账号后台）</title>
   <style>
     body { font-family: system-ui; background: #f5f5f7; margin: 0; padding: 16px; }
     .container { max-width: 720px; margin: 0 auto; }
     .card { background: white; border-radius: 16px; padding: 18px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-    .btn { background: #c8102e; color: white; border: none; padding: 12px 18px; border-radius: 12px; font-size: 15px; cursor: pointer; width: 100%; }
+    .btn { background: #c8102e; color: white; border: none; padding: 10px 14px; border-radius: 10px; font-size: 14px; cursor: pointer; }
     .btn.secondary { background: #f0f0f3; color: #333; }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn.small { padding: 6px 10px; font-size: 12px; }
     input, select { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 12px; margin-bottom: 12px; font-size: 15px; box-sizing: border-box; }
-    .log { background: #f8f9fa; padding: 12px; border-radius: 12px; max-height: 360px; overflow-y: auto; font-size: 13px; line-height: 1.5; }
-    .log-item { padding: 5px 0; border-bottom: 1px solid #eee; }
-    .status { font-size: 13px; padding: 6px 12px; border-radius: 20px; display: inline-block; }
+    .log { background: #f8f9fa; padding: 12px; border-radius: 12px; max-height: 280px; overflow-y: auto; font-size: 12px; line-height: 1.5; }
+    .log-item { padding: 4px 0; border-bottom: 1px solid #eee; }
+    .status { font-size: 12px; padding: 4px 10px; border-radius: 20px; display: inline-block; }
     .status.running { background: #d4edda; color: #155724; }
     .status.stopped { background: #f8d7da; color: #721c24; }
+    .status.success { background: #cce5ff; color: #004085; }
     .page { display: none; }
     .page.active { display: block; }
     .nav { display: flex; align-items: center; margin-bottom: 16px; }
     .nav-title { font-size: 20px; font-weight: 700; flex: 1; }
+    .acc-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #eee; gap: 8px; }
+    .acc-info { flex: 1; min-width: 0; }
+    .acc-email { font-weight: 600; font-size: 14px; word-break: break-all; }
+    .acc-meta { font-size: 12px; color: #666; margin-top: 4px; }
+    .acc-actions { display: flex; gap: 6px; flex-shrink: 0; }
     .tip { font-size: 13px; color: #666; margin-top: 8px; line-height: 1.5; }
   </style>
 </head>
@@ -398,47 +397,37 @@ const HTML = `<!DOCTYPE html>
   <div class="container">
     <div class="page active" id="pageMain">
       <div class="nav">
-        <div class="nav-title">Kite Grabber（后台版）</div>
-        <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goAddAccount()">添加账号</button>
+        <div class="nav-title">Kite Grabber（多账号）</div>
+        <button class="btn secondary" style="width:auto;padding:8px 14px;" onclick="goAddAccount()">添加账号</button>
       </div>
 
       <div class="card">
-        <h3 style="margin:0 0 12px 0;">已添加账号</h3>
-        <div id="accountList"></div>
+        <h3 style="margin:0 0 8px 0;">账号列表（可同时开多个）</h3>
+        <div class="tip">每个账号独立后台跑，互不影响。点「开始」后可关闭浏览器。</div>
+        <div id="accountList" style="margin-top:12px;"></div>
       </div>
 
       <div class="card">
-        <h3 style="margin:0 0 12px 0;">后台抢号</h3>
-        <div>
-          <label>选择账号</label>
-          <select id="selectedAccount"></select>
-        </div>
-        <div style="margin-top:12px;">
-          <label>要匹配的类（逗号分隔）</label>
-          <input id="patterns" value="aaab, abbb, aaaa, abab, abba">
-        </div>
-        <div class="tip">只购买 0.3 季包。点击「开始后台抢号」后，关闭浏览器/手机锁屏也会继续跑。</div>
-        <div style="margin-top:16px; display:flex; gap:10px;">
-          <button class="btn" id="btnStart" onclick="startGrab()">开始后台抢号</button>
-          <button class="btn secondary" id="btnStop" onclick="stopGrab()">停止</button>
-        </div>
-        <div id="grabStatus" style="margin-top:12px;"></div>
-        <div id="lastResult" style="margin-top:8px;font-size:14px;color:#333;"></div>
+        <h3 style="margin:0 0 8px 0;">全局设置</h3>
+        <label>要匹配的类（逗号分隔）</label>
+        <input id="patterns" value="aaab, abbb, aaaa, abab, abba">
+        <div class="tip">只购买 0.3 季包</div>
       </div>
 
       <div class="card">
-        <h3 style="margin:0 0 8px 0;">抢号日志 <span id="scanCount" style="font-size:13px;color:#666;"></span></h3>
+        <h3 style="margin:0 0 8px 0;">日志（当前选中账号）</h3>
+        <div id="currentEmail" style="font-size:13px;color:#666;margin-bottom:8px;"></div>
         <div id="log" class="log"></div>
         <div style="display:flex; gap:10px; margin-top:10px;">
-          <button class="btn secondary" onclick="refreshStatus()" style="flex:1;">刷新状态</button>
-          <button class="btn secondary" onclick="clearLogs()" style="flex:1;">清空日志</button>
+          <button class="btn secondary" onclick="refreshAll()" style="flex:1;">刷新全部状态</button>
+          <button class="btn secondary" onclick="clearCurrentLogs()" style="flex:1;">清空当前日志</button>
         </div>
       </div>
     </div>
 
     <div class="page" id="pageAddAccount">
       <div class="nav">
-        <button class="btn secondary" style="width:auto;padding:8px 16px;" onclick="goMain()">返回</button>
+        <button class="btn secondary" style="width:auto;padding:8px 14px;" onclick="goMain()">返回</button>
         <div class="nav-title" style="text-align:center;">添加账号</div>
         <div style="width:60px"></div>
       </div>
@@ -449,7 +438,7 @@ const HTML = `<!DOCTYPE html>
           <input id="captchaCode" placeholder="验证码" style="flex:1; margin-bottom:0;">
           <img id="captchaImg" onclick="loadCaptcha()" style="height:46px; width:110px; border-radius:10px; cursor:pointer;">
         </div>
-        <button class="btn" onclick="doLogin()">登录并添加</button>
+        <button class="btn" style="width:100%;" onclick="doLogin()">登录并添加</button>
         <div id="loginMsg" style="margin-top:10px; text-align:center; font-size:14px;"></div>
       </div>
     </div>
@@ -458,7 +447,9 @@ const HTML = `<!DOCTYPE html>
 <script>
   let accounts = JSON.parse(localStorage.getItem('grabber_accounts') || '[]');
   let captchaKey = '';
+  let currentViewEmail = null;
   let statusTimer = null;
+  let statusMap = {};
 
   function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
 
@@ -470,7 +461,7 @@ const HTML = `<!DOCTYPE html>
   function goMain() {
     showPage('pageMain');
     renderAccounts();
-    refreshStatus();
+    refreshAll();
   }
 
   function goAddAccount() {
@@ -483,31 +474,35 @@ const HTML = `<!DOCTYPE html>
     const container = document.getElementById('accountList');
     container.innerHTML = '';
     if (accounts.length === 0) {
-      container.innerHTML = '<div style="color:#888;">还没有账号，点击右上角“添加账号”</div>';
+      container.innerHTML = '<div style="color:#888;padding:12px 0;">还没有账号</div>';
       return;
     }
-    accounts.forEach((acc, index) => {
-      const div = document.createElement('div');
-      div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee;';
-      div.innerHTML = \`
-        <div><strong>\${acc.email}</strong></div>
-        <div>
-          <button onclick="removeAccount(\${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
-        </div>
-      \`;
-      container.appendChild(div);
-    });
-    updateAccountSelect();
-  }
 
-  function updateAccountSelect() {
-    const select = document.getElementById('selectedAccount');
-    select.innerHTML = '';
     accounts.forEach((acc, index) => {
-      const opt = document.createElement('option');
-      opt.value = index;
-      opt.textContent = acc.email;
-      select.appendChild(opt);
+      const st = statusMap[acc.email] || {};
+      const isRunning = !!st.isRunning;
+      const lastPhone = st.lastPhone;
+
+      let statusHtml = '';
+      if (lastPhone) {
+        statusHtml = '<span class="status success">已占到 ' + lastPhone + '</span>';
+      } else if (isRunning) {
+        statusHtml = '<span class="status running">运行中 · ' + (st.totalScanned || 0) + '次</span>';
+      } else {
+        statusHtml = '<span class="status stopped">已停止</span>';
+      }
+
+      const div = document.createElement('div');
+      div.className = 'acc-row';
+      div.innerHTML = '<div class="acc-info" onclick="viewLogs(\\'' + acc.email + '\\')" style="cursor:pointer;">' +
+        '<div class="acc-email">' + acc.email + '</div>' +
+        '<div class="acc-meta">' + statusHtml + '</div></div>' +
+        '<div class="acc-actions">' +
+        '<button class="btn small" ' + (isRunning ? 'disabled' : '') + ' onclick="startOne(\\'' + acc.email + '\\')">开始</button>' +
+        '<button class="btn secondary small" onclick="stopOne(\\'' + acc.email + '\\')">停止</button>' +
+        '<button class="btn secondary small" style="color:#c8102e;" onclick="removeAccount(' + index + ')">删</button>' +
+        '</div>';
+      container.appendChild(div);
     });
   }
 
@@ -565,15 +560,16 @@ const HTML = `<!DOCTYPE html>
 
   function removeAccount(index) {
     if (!confirm('确定删除？')) return;
+    const email = accounts[index].email;
+    fetch('/grab/' + encodeURIComponent(email) + '/stop', { method: 'POST' }).catch(() => {});
     accounts.splice(index, 1);
     saveAccounts();
+    delete statusMap[email];
     renderAccounts();
   }
 
-  async function startGrab() {
-    const select = document.getElementById('selectedAccount');
-    if (!select.value) { alert('请先选择账号'); return; }
-    const acc = accounts[parseInt(select.value)];
+  async function startOne(email) {
+    const acc = accounts.find(a => a.email === email);
     if (!acc) return;
 
     const patterns = document.getElementById('patterns').value
@@ -581,9 +577,8 @@ const HTML = `<!DOCTYPE html>
       .map(p => p.trim())
       .filter(Boolean);
 
-    document.getElementById('btnStart').disabled = true;
     try {
-      const res = await fetch('/grab/start', {
+      const res = await fetch('/grab/' + encodeURIComponent(email) + '/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -594,74 +589,73 @@ const HTML = `<!DOCTYPE html>
       });
       const json = await res.json();
       if (json.ok) {
-        alert('已启动后台抢号！现在可以关闭浏览器了');
-        refreshStatus();
-        startAutoRefresh();
+        viewLogs(email);
+        refreshAll();
       } else {
         alert(json.error || '启动失败');
       }
     } catch (e) {
       alert('请求失败: ' + e.message);
     }
-    document.getElementById('btnStart').disabled = false;
   }
 
-  async function stopGrab() {
+  async function stopOne(email) {
     try {
-      await fetch('/grab/stop', { method: 'POST' });
-      refreshStatus();
+      await fetch('/grab/' + encodeURIComponent(email) + '/stop', { method: 'POST' });
+      refreshAll();
     } catch (e) {
       alert('停止失败');
     }
   }
 
-  async function refreshStatus() {
+  async function viewLogs(email) {
+    currentViewEmail = email;
+    document.getElementById('currentEmail').textContent = '当前查看：' + email;
+    await refreshOne(email);
+  }
+
+  async function refreshOne(email) {
     try {
-      const res = await fetch('/grab/status');
+      const res = await fetch('/grab/' + encodeURIComponent(email) + '/status');
       const data = await res.json();
+      statusMap[email] = data;
 
-      const statusEl = document.getElementById('grabStatus');
-      if (data.isRunning) {
-        statusEl.innerHTML = '<span class="status running">后台运行中...</span>';
-        document.getElementById('btnStart').disabled = true;
-      } else {
-        statusEl.innerHTML = '<span class="status stopped">已停止</span>';
-        document.getElementById('btnStart').disabled = false;
-      }
-
-      document.getElementById('scanCount').textContent = data.totalScanned
-        ? \`共轮询 \${data.totalScanned} 次\`
-        : '';
-
-      if (data.lastPhone) {
-        document.getElementById('lastResult').innerHTML =
-          \`最近成功：<b>\${data.lastPhone}</b> | 订单号 \${data.lastOrderNo}\`;
-      }
-
-      const logEl = document.getElementById('log');
-      if (data.logs && data.logs.length) {
-        logEl.innerHTML = data.logs.slice().reverse().map(l =>
-          \`<div class="log-item">\${l}</div>\`
-        ).join('');
+      if (currentViewEmail === email) {
+        const logEl = document.getElementById('log');
+        if (data.logs && data.logs.length) {
+          logEl.innerHTML = data.logs.slice().reverse().map(function(l) {
+            return '<div class="log-item">' + l + '</div>';
+          }).join('');
+        } else {
+          logEl.innerHTML = '<div style="color:#888;">暂无日志</div>';
+        }
       }
     } catch (e) {
       console.error(e);
     }
   }
 
-  async function clearLogs() {
-    await fetch('/grab/clear-logs', { method: 'POST' });
+  async function refreshAll() {
+    for (const acc of accounts) {
+      await refreshOne(acc.email);
+    }
+    renderAccounts();
+  }
+
+  async function clearCurrentLogs() {
+    if (!currentViewEmail) return;
+    await fetch('/grab/' + encodeURIComponent(currentViewEmail) + '/clear-logs', { method: 'POST' });
     document.getElementById('log').innerHTML = '';
   }
 
   function startAutoRefresh() {
     if (statusTimer) clearInterval(statusTimer);
-    statusTimer = setInterval(refreshStatus, 5000);
+    statusTimer = setInterval(refreshAll, 6000);
   }
 
   function init() {
     renderAccounts();
-    refreshStatus();
+    refreshAll();
     startAutoRefresh();
   }
 
