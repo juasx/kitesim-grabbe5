@@ -96,7 +96,6 @@ const HTML = `<!DOCTYPE html>
       <div class="card">
         <h3 style="margin:0 0 8px 0;">抢号日志 <span id="scanCount" style="font-size:13px;color:#666;"></span></h3>
         <div id="log" class="log"></div>
-       
         <div style="display:flex; gap:10px; margin-top:10px;">
           <button class="btn secondary" onclick="clearLog()" style="flex:1;">清空日志</button>
           <button class="btn secondary" onclick="showSeenNumbers()" style="flex:1;">查看已扫号码（去重）</button>
@@ -161,16 +160,16 @@ const HTML = `<!DOCTYPE html>
       const isGrabbed = grabbedAccounts.includes(acc.email);
       const div = document.createElement('div');
       div.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #eee;';
-      div.innerHTML = `
+      div.innerHTML = \`
         <div>
-          <strong>${acc.email}</strong>
-          ${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
+          <strong>\${acc.email}</strong>
+          \${isGrabbed ? '<span style="color:#c8102e;font-size:12px;margin-left:8px;">[已抢/锁定]</span>' : ''}
         </div>
         <div>
-          <button onclick="resetAccount(${index})" style="padding:4px 10px;font-size:12px;">重置</button>
-          <button onclick="removeAccount(${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
+          <button onclick="resetAccount(\${index})" style="padding:4px 10px;font-size:12px;">重置</button>
+          <button onclick="removeAccount(\${index})" style="padding:4px 10px;font-size:12px;color:#c8102e;">删除</button>
         </div>
-      `;
+      \`;
       container.appendChild(div);
     });
     updateAccountSelect();
@@ -262,11 +261,11 @@ const HTML = `<!DOCTYPE html>
   function addLog(text) {
     const log = document.getElementById('log');
     const time = new Date().toLocaleTimeString();
-    log.innerHTML = `<div class="log-item">[${time}] ${text}</div>` + log.innerHTML;
+    log.innerHTML = \`<div class="log-item">[\${time}] \${text}</div>\` + log.innerHTML;
   }
 
   function updateScanCount() {
-    document.getElementById('scanCount').textContent = `共轮询 ${totalScanned} 次`;
+    document.getElementById('scanCount').textContent = \`共轮询 \${totalScanned} 次\`;
   }
 
   function clearLog() {
@@ -275,6 +274,7 @@ const HTML = `<!DOCTYPE html>
     updateScanCount();
   }
 
+  // ==================== 正确的匹配逻辑 ====================
   function matchesPattern(last4, pattern) {
     if (!last4 || last4.length !== 4) return false;
     const [a, b, c, d] = last4.split('');
@@ -321,7 +321,7 @@ const HTML = `<!DOCTYPE html>
     } catch (e) { return { code: 0, message: e.message }; }
   }
 
-  // ==================== 只修改了这里（锁号逻辑） ====================
+  // ==================== 核心抢号逻辑（已按抓包步调修复：成功以 status=1 未支付订单记录为准） ====================
   async function pollOnce() {
     const select = document.getElementById('selectedAccount');
     if (!select.value) return;
@@ -330,14 +330,15 @@ const HTML = `<!DOCTYPE html>
     if (!acc) return;
 
     if (grabbedAccounts.includes(acc.email)) {
-      addLog(`${acc.email} 已抢过，跳过`);
+      addLog(\`\${acc.email} 已抢过，跳过\`);
       stopGrab();
       return;
     }
 
+    // 第一步：检查是否已有未支付订单（status=1）
     const hasPaid = await checkHasPaidNumber(acc.token);
     if (hasPaid) {
-      addLog(`${acc.email} 已有付费CA号，自动锁定`);
+      addLog(\`\${acc.email} 已有未支付CA号，自动锁定\`);
       grabbedAccounts.push(acc.email);
       saveGrabbed();
       renderAccounts();
@@ -345,6 +346,7 @@ const HTML = `<!DOCTYPE html>
       return;
     }
 
+    // 第二步：获取新号码列表
     try {
       const numRes = await getNewNumber(acc.token);
       totalScanned++;
@@ -355,6 +357,7 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
+      // 记录本次扫到的所有号码（去重）
       numRes.data.forEach(item => {
         if (item.phoneNumber && !seenNumbers.has(item.phoneNumber)) {
           seenNumbers.add(item.phoneNumber);
@@ -368,7 +371,7 @@ const HTML = `<!DOCTYPE html>
 
       for (const item of numRes.data) {
         if (!item.phoneNumber) continue;
-        if (item.buyPrice !== 0.30) continue;
+        if (item.buyPrice !== 0.30) continue; // 只买0.3季包
         const last4 = item.phoneNumber.slice(-4);
         for (const pat of patterns) {
           if (matchesPattern(last4, pat)) {
@@ -381,29 +384,40 @@ const HTML = `<!DOCTYPE html>
       }
 
       if (!matchedPhone) {
-        addLog(`共轮询 ${totalScanned} 次 | 本次无符合条件的号码，跳过`);
+        addLog(\`共轮询 \${totalScanned} 次 | 本次无符合条件的号码，跳过\`);
         return;
       }
 
-      addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始购买...`);
+      addLog(\`发现 \${matchedClass}类 号码 \${matchedPhone}（0.3季包），开始占号...\`);
 
+      // 第三步：占号（buy）
       const buyRes = await buyNumber(matchedPhone, acc.token);
+      if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
+        addLog(\`占号失败（\${buyRes.message || '未知'}），继续轮询...\`);
+        return; // 不锁定，继续尝试
+      }
 
-      if (buyRes.code === 200 && buyRes.data?.orderNo) {
-        // 只有这里改了：成功才锁定
-        const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
-        const resultText = payRes.code === 200 ? '购买成功' : `付款失败（${payRes.message || '余额不足'}）`;
+      addLog(\`占号成功，订单号 \${buyRes.data.orderNo}，开始确认支付...\`);
 
-        addLog(`【占号成功】${matchedClass}类 号码 ${matchedPhone} | ${resultText}`);
+      // 第四步：确认支付（confirmPay）
+      const payRes = await confirmPay(buyRes.data.orderNo, acc.token);
+      if (payRes.code !== 200) {
+        addLog(\`确认支付返回失败（\${payRes.message || '未知'}），但已尝试\`);
+      }
 
+      // 第五步：关键校验！重新检查未支付订单列表（status=1），只有出现记录才算真正占成功
+      await new Promise(resolve => setTimeout(resolve, 1800)); // 等待后端同步
+      const hasPaidAfter = await checkHasPaidNumber(acc.token);
+
+      if (hasPaidAfter) {
+        addLog(\`【成功锁定】\${matchedClass}类 号码 \${matchedPhone} | 未支付订单已生成，账号锁定\`);
         grabbedAccounts.push(acc.email);
         saveGrabbed();
         renderAccounts();
         stopGrab();
-
       } else {
-        // 失败不锁定
-        addLog(`【占号失败】${matchedClass}类 号码 ${matchedPhone} | ${buyRes.message || 'Server Exception'}`);
+        addLog(\`校验失败：未支付订单列表仍为空，占号可能未生效或失败，继续轮询尝试...\`);
+        // 不锁定账号，继续下一次 poll
       }
 
     } catch (e) {
@@ -426,28 +440,30 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('grabStatus').innerHTML = '<span class="status stopped">已停止</span>';
   }
 
+  // 查看已扫到的号码（去重）
   function showSeenNumbers() {
     if (seenNumbersList.length === 0) {
       alert('还没有扫到任何号码');
       return;
     }
-    const list = seenNumbersList.join('\n');
+    const list = seenNumbersList.join('\\n');
     const win = window.open('', '_blank');
-    win.document.write(`
+    win.document.write(\`
       <html>
-        <head><title>已扫到的号码（共 ${seenNumbersList.length} 个）</title></head>
+        <head><title>已扫到的号码（共 \${seenNumbersList.length} 个）</title></head>
         <body style="font-family:monospace; padding:20px; white-space:pre-line; line-height:1.6;">
-          <h3>已扫到的唯一号码（共 ${seenNumbersList.length} 个）</h3>
-          ${list}
+          <h3>已扫到的唯一号码（共 \${seenNumbersList.length} 个）</h3>
+          \${list}
         </body>
       </html>
-    `);
+    \`);
   }
 
   function init() {
     renderAccounts();
     updateScanCount();
   }
+
   init();
 </script>
 </body>
