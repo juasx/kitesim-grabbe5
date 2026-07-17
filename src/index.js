@@ -194,7 +194,17 @@ export class GrabberDO extends DurableObject {
 
     const buyRes = await this.buyNumber(matchedPhone, token);
     if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
-      await this.addLog(`占号失败（${buyRes.message || "未知"}），继续轮询...`);
+      const msg = buyRes.message || "未知";
+      // 已有待支付订单 = 实际上已经占过号了，暂停 30 分钟
+      if (msg.includes("待支付") || msg.includes("无法购买新号码")) {
+        state.pauseUntil = Date.now() + 30 * 60 * 1000;
+        state.lastPhone = matchedPhone; // 记录这次尝试的号码
+        await this.ctx.storage.put("state", state);
+        await this.addLog(`账号已有待支付订单（可能已占到号），暂停 30 分钟后再试`);
+        await this.addLog(`失败信息：${msg}`);
+        return;
+      }
+      await this.addLog(`占号失败（${msg}），继续轮询...`);
       return;
     }
 
@@ -239,24 +249,26 @@ export class GrabberDO extends DurableObject {
     return false;
   }
 
-  async checkHasPaidNumber(token) {
-    try {
-      const res = await fetch(
-        "https://api.kitesim.co/userPhonePurchase/getOrderPage?page=1&size=10&status=1&phone=",
-        {
-          headers: {
-            token,
-            Origin: "https://h5.kitesim.co",
-            Referer: "https://h5.kitesim.co/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-          },
-        }
-      );
-      const data = await res.json();
-      return data.data?.records?.length > 0;
-    } catch (e) {
-      return false;
+    async checkHasPaidNumber(token) {
+    // 同时查 status=0/1/2，避免漏掉待支付订单
+    const statuses = [0, 1, 2];
+    const headers = {
+      token,
+      Origin: "https://h5.kitesim.co",
+      Referer: "https://h5.kitesim.co/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    };
+    for (const st of statuses) {
+      try {
+        const res = await fetch(
+          `https://api.kitesim.co/userPhonePurchase/getOrderPage?page=1&size=10&status=${st}&phone=`,
+          { headers }
+        );
+        const data = await res.json();
+        if (data.data?.records?.length > 0) return true;
+      } catch (e) {}
     }
+    return false;
   }
 
   async getNewNumber(token) {
