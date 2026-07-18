@@ -1,12 +1,338 @@
 import { DurableObject } from "cloudflare:workers";
 
-// Durable Object 部分（不变）
+// ==================== Durable Object：每个账号独立实例 ====================
 export class GrabberDO extends DurableObject {
-  // ... (保持你上一个版本的完整 DO 代码)
-  // 为了简洁，这里省略，实际用你已有的完整 DO
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
+    }
+
+    try {
+      if (path === "/start" && request.method === "POST") {
+        const body = await request.json();
+        return await this.startGrab(body);
+      }
+      if (path === "/stop" && request.method === "POST") {
+        return await this.stopGrab();
+      }
+      if (path === "/status") {
+        return await this.getStatus();
+      }
+      if (path === "/clear-logs" && request.method === "POST") {
+        await this.ctx.storage.put("logs", []);
+        return json({ ok: true });
+      }
+      return json({ error: "not found" }, 404);
+    } catch (e) {
+      return json({ error: e.message }, 500);
+    }
+  }
+
+  async startGrab({ email, token, patterns }) {
+    if (!email || !token) {
+      return json({ error: "缺少 email 或 token" }, 400);
+    }
+
+    const old = (await this.ctx.storage.get("state")) || {};
+    const history = old.history || [];
+
+    const state = {
+      email,
+      token,
+      patterns: patterns || ["aaab", "abbb", "aaaa", "abab", "abba"],
+      isRunning: true,
+      totalScanned: old.totalScanned || 0,
+      lastPhone: old.lastPhone || null,
+      lastOrderNo: old.lastOrderNo || null,
+      pauseUntil: 0,
+      history,
+      startedAt: Date.now(),
+    };
+
+    await this.ctx.storage.put("state", state);
+    await this.addLog(`开始抢号：${email} | 匹配类：${state.patterns.join(",")}`);
+
+    await this.pollOnce();
+    await this.ctx.storage.setAlarm(Date.now() + 10000);
+
+    return json({ ok: true, message: "已启动后台抢号" });
+  }
+
+  async stopGrab() {
+    const state = (await this.ctx.storage.get("state")) || {};
+    state.isRunning = false;
+    await this.ctx.storage.put("state", state);
+    await this.ctx.storage.deleteAlarm();
+    await this.addLog("已停止抢号");
+    return json({ ok: true });
+  }
+
+  async getStatus() {
+    const state = (await this.ctx.storage.get("state")) || { isRunning: false };
+    const logs = (await this.ctx.storage.get("logs")) || [];
+    const now = Date.now();
+    const pauseUntil = state.pauseUntil || 0;
+    const isPaused = pauseUntil > now;
+    return json({
+      isRunning: !!state.isRunning,
+      isPaused,
+      pauseUntil,
+      email: state.email || null,
+      totalScanned: state.totalScanned || 0,
+      lastPhone: state.lastPhone || null,
+      lastOrderNo: state.lastOrderNo || null,
+      history: state.history || [],
+      logs: logs.slice(-40),
+    });
+  }
+
+  async alarm() {
+    const state = await this.ctx.storage.get("state");
+    if (!state || !state.isRunning) return;
+
+    const now = Date.now();
+    if (state.pauseUntil && state.pauseUntil > now) {
+      const leftMin = Math.ceil((state.pauseUntil - now) / 60000);
+      if (!state.lastPauseLog || now - state.lastPauseLog > 55000) {
+        await this.addLog(`暂停中，约 ${leftMin} 分钟后恢复抢号...`);
+        state.lastPauseLog = now;
+        await this.ctx.storage.put("state", state);
+      }
+      await this.ctx.storage.setAlarm(Math.min(state.pauseUntil, now + 60000));
+      return;
+    }
+
+    if (state.pauseUntil && state.pauseUntil <= now) {
+      state.pauseUntil = 0;
+      await this.ctx.storage.put("state", state);
+      await this.addLog("暂停结束，恢复抢号");
+    }
+
+    try {
+      await this.pollOnce();
+    } catch (e) {
+      await this.addLog("轮询出错: " + e.message);
+    }
+
+    const latest = await this.ctx.storage.get("state");
+    if (latest && latest.isRunning) {
+      if (latest.pauseUntil && latest.pauseUntil > Date.now()) {
+        await this.ctx.storage.setAlarm(Math.min(latest.pauseUntil, Date.now() + 60000));
+      } else {
+        await this.ctx.storage.setAlarm(Date.now() + 10000);
+      }
+    }
+  }
+
+  async pollOnce() {
+    const state = await this.ctx.storage.get("state");
+    if (!state || !state.isRunning) return;
+
+    const { token, email, patterns } = state;
+
+    const hasPaid = await this.checkHasPaidNumber(token);
+    if (hasPaid) {
+      state.pauseUntil = Date.now() + 30 * 60 * 1000;
+      await this.ctx.storage.put("state", state);
+      await this.addLog(`${email} 已有未支付订单，暂停 30 分钟后再试`);
+      return;
+    }
+
+    const numRes = await this.getNewNumber(token);
+    state.totalScanned = (state.totalScanned || 0) + 1;
+    await this.ctx.storage.put("state", state);
+
+    if (numRes.code !== 200 || !Array.isArray(numRes.data) || numRes.data.length === 0) {
+      await this.addLog(`第 ${state.totalScanned} 次 | 获取号码失败`);
+      return;
+    }
+
+    let matchedPhone = null;
+    let matchedClass = "";
+
+    for (const item of numRes.data) {
+      if (!item.phoneNumber || item.buyPrice !== 0.3) continue;
+      const last4 = item.phoneNumber.slice(-4);
+      for (const pat of patterns) {
+        if (this.matchesPattern(last4, pat)) {
+          matchedPhone = item.phoneNumber;
+          matchedClass = pat;
+          break;
+        }
+      }
+      if (matchedPhone) break;
+    }
+
+    if (!matchedPhone) {
+      await this.addLog(`第 ${state.totalScanned} 次 | 无符合条件号码`);
+      return;
+    }
+
+    await this.addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始占号...`);
+
+    const buyRes = await this.buyNumber(matchedPhone, token);
+    if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
+      const msg = buyRes.message || "未知";
+      if (msg.includes("待支付") || msg.includes("无法购买新号码")) {
+        state.pauseUntil = Date.now() + 30 * 60 * 1000;
+        state.lastPhone = matchedPhone;
+        await this.ctx.storage.put("state", state);
+        await this.addLog(`账号已有待支付订单（可能已占到号），暂停 30 分钟后再试`);
+        await this.addLog(`失败信息：${msg}`);
+        return;
+      }
+      await this.addLog(`占号失败（${msg}），继续轮询...`);
+      return;
+    }
+
+    state.lastPhone = matchedPhone;
+    state.lastOrderNo = buyRes.data.orderNo;
+    state.pauseUntil = Date.now() + 30 * 60 * 1000;
+    state.history = state.history || [];
+    state.history.push({
+      phone: matchedPhone,
+      orderNo: buyRes.data.orderNo,
+      class: matchedClass,
+      time: new Date().toLocaleString("zh-CN", { hour12: false }),
+    });
+    if (state.history.length > 20) state.history = state.history.slice(-20);
+    await this.ctx.storage.put("state", state);
+
+    await this.addLog(`【成功】${matchedClass}类 ${matchedPhone} | 订单号 ${buyRes.data.orderNo}`);
+    await this.addLog(`已暂停 30 分钟，之后自动恢复抢号`);
+
+    try {
+      const payRes = await this.confirmPay(buyRes.data.orderNo, token);
+      if (payRes.code === 200) {
+        await this.addLog("确认支付成功");
+      } else {
+        await this.addLog(`确认支付返回（${payRes.message || "未知"}），订单已生成`);
+      }
+    } catch (e) {
+      await this.addLog("确认支付异常，但订单已生成");
+    }
+  }
+
+  matchesPattern(last4, pattern) {
+    if (!last4 || last4.length !== 4) return false;
+    const [a, b, c, d] = last4.split("");
+    if (pattern === "aaaa") return a === b && b === c && c === d;
+    if (pattern === "aaab") return a === b && b === c && c !== d;
+    if (pattern === "abbb") return a !== b && b === c && c === d;
+    if (pattern === "abab") return a === c && b === d && a !== b;
+    if (pattern === "abba") return a === d && b === c && a !== b;
+    return false;
+  }
+
+  async checkHasPaidNumber(token) {
+    const headers = {
+      token,
+      Origin: "https://h5.kitesim.co",
+      Referer: "https://h5.kitesim.co/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    };
+    for (const st of [0, 1, 2]) {
+      try {
+        const res = await fetch(
+          `https://api.kitesim.co/userPhonePurchase/getOrderPage?page=1&size=10&status=${st}&phone=`,
+          { headers }
+        );
+        const data = await res.json();
+        if (data.data?.records?.length > 0) return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+
+  async getNewNumber(token) {
+    const res = await fetch("https://api.kitesim.co/countryCode/getPhoneNumber/CA", {
+      headers: {
+        token,
+        Origin: "https://h5.kitesim.co",
+        Referer: "https://h5.kitesim.co/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+      },
+    });
+    return await res.json();
+  }
+
+  async buyNumber(phoneNumber, token) {
+    try {
+      const res = await fetch("https://api.kitesim.co/userPhonePurchase/buyPhoneNumberOrder", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          token,
+          Origin: "https://h5.kitesim.co",
+          Referer: "https://h5.kitesim.co/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        },
+        body: JSON.stringify({
+          autoRenew: 0,
+          countryCode: "CA",
+          couponId: null,
+          couponType: null,
+          isSelected: 0,
+          packageId: "1958014808238002177",
+          phoneNumber,
+          serviceId: "",
+          type: 1,
+        }),
+      });
+      return await res.json();
+    } catch (e) {
+      return { code: 0, message: e.message };
+    }
+  }
+
+  async confirmPay(orderNo, token) {
+    try {
+      const res = await fetch("https://api.kitesim.co/userPhonePurchase/confirmPay", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          token,
+          Origin: "https://h5.kitesim.co",
+          Referer: "https://h5.kitesim.co/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        },
+        body: JSON.stringify({
+          paymentMethod: 1,
+          payChannel: "1",
+          orderNo,
+        }),
+      });
+      return await res.json();
+    } catch (e) {
+      return { code: 0, message: e.message };
+    }
+  }
+
+  async addLog(text) {
+    const logs = (await this.ctx.storage.get("logs")) || [];
+    const time = new Date().toLocaleString("zh-CN", { hour12: false });
+    logs.push(`[${time}] ${text}`);
+    if (logs.length > 80) logs.splice(0, logs.length - 80);
+    await this.ctx.storage.put("logs", logs);
+  }
 }
 
-// 主 Worker 和 HTML
+// ==================== 主 Worker ====================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
