@@ -48,6 +48,7 @@ export class GrabberDO extends DurableObject {
       return json({ error: "缺少 email 或 token" }, 400);
     }
 
+    // 保留历史成功记录
     const old = (await this.ctx.storage.get("state")) || {};
     const history = old.history || [];
 
@@ -106,17 +107,21 @@ export class GrabberDO extends DurableObject {
     if (!state || !state.isRunning) return;
 
     const now = Date.now();
+    // 还在暂停期
     if (state.pauseUntil && state.pauseUntil > now) {
       const leftMin = Math.ceil((state.pauseUntil - now) / 60000);
+      // 每分钟打一次日志提示
       if (!state.lastPauseLog || now - state.lastPauseLog > 55000) {
         await this.addLog(`暂停中，约 ${leftMin} 分钟后恢复抢号...`);
         state.lastPauseLog = now;
         await this.ctx.storage.put("state", state);
       }
+      // 精确约到暂停结束
       await this.ctx.storage.setAlarm(Math.min(state.pauseUntil, now + 60000));
       return;
     }
 
+    // 暂停刚结束
     if (state.pauseUntil && state.pauseUntil <= now) {
       state.pauseUntil = 0;
       await this.ctx.storage.put("state", state);
@@ -131,6 +136,7 @@ export class GrabberDO extends DurableObject {
 
     const latest = await this.ctx.storage.get("state");
     if (latest && latest.isRunning) {
+      // 如果刚成功进入暂停，约到暂停结束；否则 10 秒后
       if (latest.pauseUntil && latest.pauseUntil > Date.now()) {
         await this.ctx.storage.setAlarm(Math.min(latest.pauseUntil, Date.now() + 60000));
       } else {
@@ -147,6 +153,7 @@ export class GrabberDO extends DurableObject {
 
     const hasPaid = await this.checkHasPaidNumber(token);
     if (hasPaid) {
+      // 已有待支付订单，暂停 30 分钟再试（给用户时间处理订单）
       state.pauseUntil = Date.now() + 30 * 60 * 1000;
       await this.ctx.storage.put("state", state);
       await this.addLog(`${email} 已有未支付订单，暂停 30 分钟后再试`);
@@ -188,9 +195,10 @@ export class GrabberDO extends DurableObject {
     const buyRes = await this.buyNumber(matchedPhone, token);
     if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
       const msg = buyRes.message || "未知";
+      // 已有待支付订单 = 实际上已经占过号了，暂停 30 分钟
       if (msg.includes("待支付") || msg.includes("无法购买新号码")) {
         state.pauseUntil = Date.now() + 30 * 60 * 1000;
-        state.lastPhone = matchedPhone;
+        state.lastPhone = matchedPhone; // 记录这次尝试的号码
         await this.ctx.storage.put("state", state);
         await this.addLog(`账号已有待支付订单（可能已占到号），暂停 30 分钟后再试`);
         await this.addLog(`失败信息：${msg}`);
@@ -200,9 +208,10 @@ export class GrabberDO extends DurableObject {
       return;
     }
 
+    // 返回订单号 = 成功 → 记录历史，暂停 30 分钟后自动恢复
     state.lastPhone = matchedPhone;
     state.lastOrderNo = buyRes.data.orderNo;
-    state.pauseUntil = Date.now() + 30 * 60 * 1000;
+    state.pauseUntil = Date.now() + 30 * 60 * 1000; // 30 分钟
     state.history = state.history || [];
     state.history.push({
       phone: matchedPhone,
@@ -210,6 +219,7 @@ export class GrabberDO extends DurableObject {
       class: matchedClass,
       time: new Date().toLocaleString("zh-CN", { hour12: false }),
     });
+    // 只保留最近 20 条历史
     if (state.history.length > 20) state.history = state.history.slice(-20);
     await this.ctx.storage.put("state", state);
 
@@ -239,14 +249,16 @@ export class GrabberDO extends DurableObject {
     return false;
   }
 
-  async checkHasPaidNumber(token) {
+    async checkHasPaidNumber(token) {
+    // 同时查 status=0/1/2，避免漏掉待支付订单
+    const statuses = [0, 1, 2];
     const headers = {
       token,
       Origin: "https://h5.kitesim.co",
       Referer: "https://h5.kitesim.co/",
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
     };
-    for (const st of [0, 1, 2]) {
+    for (const st of statuses) {
       try {
         const res = await fetch(
           `https://api.kitesim.co/userPhonePurchase/getOrderPage?page=1&size=10&status=${st}&phone=`,
@@ -347,22 +359,24 @@ export default {
       });
     }
 
+    // /grab/<email>/start  /grab/<email>/stop  /grab/<email>/status
     if (url.pathname.startsWith("/grab/")) {
-      const parts = url.pathname.split("/").filter(Boolean);
+      const parts = url.pathname.split("/").filter(Boolean); // ["grab", "email@xx.com", "start"]
       if (parts.length >= 3) {
         const email = decodeURIComponent(parts[1]);
-        const action = parts[2];
+        const action = parts[2]; // start / stop / status / clear-logs
 
-        const id = env.GRABBER.idFromName(email);
+        const id = env.GRABBER.idFromName(email); // 每个邮箱独立实例
         const stub = env.GRABBER.get(id);
 
         const newUrl = new URL(request.url);
         newUrl.pathname = "/" + action;
         return stub.fetch(new Request(newUrl, request));
       }
-      return json({ error: "path error" }, 400);
+      return json({ error: "path error, use /grab/<email>/start|stop|status" }, 400);
     }
 
+    // 原有代理
     if (url.pathname.startsWith("/api/")) {
       const targetPath = url.pathname.replace(/^\/api/, "") + url.search;
       const target = "https://api.kitesim.co" + targetPath;
@@ -405,6 +419,7 @@ function json(data, status = 200) {
   });
 }
 
+// ==================== 前端（支持多账号并行） ====================
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -442,7 +457,7 @@ const HTML = `<!DOCTYPE html>
   <div class="container">
     <div class="page active" id="pageMain">
       <div class="nav">
-        <div class="nav-title">Kite Grabber（多账号后台）</div>
+        <div class="nav-title">Kite Grabber（多账号）</div>
         <button class="btn secondary" style="width:auto;padding:8px 14px;" onclick="goAddAccount()">添加账号</button>
       </div>
 
@@ -495,7 +510,7 @@ const HTML = `<!DOCTYPE html>
   let captchaKey = '';
   let currentViewEmail = null;
   let statusTimer = null;
-  let statusMap = {};
+  let statusMap = {}; // email -> status
 
   function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
 
@@ -527,11 +542,10 @@ const HTML = `<!DOCTYPE html>
     accounts.forEach((acc, index) => {
       const st = statusMap[acc.email] || {};
       const isRunning = !!st.isRunning;
-      const isPaused = !!st.isPaused;
       const lastPhone = st.lastPhone;
 
       let statusHtml = '';
-      if (isPaused) {
+      if (st.isPaused) {
         const left = st.pauseUntil ? Math.ceil((st.pauseUntil - Date.now()) / 60000) : 30;
         statusHtml = '<span class="status success">暂停中 · ' + left + '分钟后恢复</span>';
       } else if (lastPhone && !isRunning) {
@@ -544,40 +558,19 @@ const HTML = `<!DOCTYPE html>
 
       const div = document.createElement('div');
       div.className = 'acc-row';
-      div.innerHTML = '<div class="acc-info" onclick="viewLogs(\\'' + acc.email + '\\')" style="cursor:pointer;">' +
-        '<div class="acc-email">' + acc.email + '</div>' +
-        '<div class="acc-meta">' + statusHtml + '</div></div>' +
-        '<div class="acc-actions">' +
-        '<button class="btn small" ' + (isRunning || isPaused ? 'disabled' : '') + ' onclick="startOne(\\'' + acc.email + '\\')">开始</button>' +
-        '<button class="btn secondary small" onclick="checkToken(\\'' + acc.email + '\\')">检查</button>' +
-        '<button class="btn secondary small" onclick="stopOne(\\'' + acc.email + '\\')">停止</button>' +
-        '<button class="btn secondary small" style="color:#c8102e;" onclick="removeAccount(' + index + ')">删</button>' +
-        '</div>';
+      div.innerHTML = \`
+        <div class="acc-info" onclick="viewLogs('\${acc.email}')" style="cursor:pointer;">
+          <div class="acc-email">\${acc.email}</div>
+          <div class="acc-meta">\${statusHtml}</div>
+        </div>
+        <div class="acc-actions">
+          <button class="btn small" \${isRunning ? 'disabled' : ''} onclick="startOne('\${acc.email}')">开始</button>
+          <button class="btn secondary small" onclick="stopOne('\${acc.email}')">停止</button>
+          <button class="btn secondary small" style="color:#c8102e;" onclick="removeAccount(\${index})">删</button>
+        </div>
+      \`;
       container.appendChild(div);
     });
-  }
-
-  async function checkToken(email) {
-    const acc = accounts.find(a => a.email === email);
-    if (!acc) return alert('账号不存在');
-
-    const btn = event.target;
-    if (btn) btn.disabled = true;
-
-    try {
-      const res = await fetch('/grab/' + encodeURIComponent(email) + '/status');
-      const data = await res.json();
-
-      if (data.isRunning || data.isPaused || data.lastPhone) {
-        alert('✅ Token 有效');
-      } else {
-        alert('❌ Token 可能已失效，请重新登录');
-      }
-    } catch (e) {
-      alert('检查失败: ' + e.message);
-    }
-
-    if (btn) btn.disabled = false;
   }
 
   async function loadCaptcha() {
@@ -635,6 +628,7 @@ const HTML = `<!DOCTYPE html>
   function removeAccount(index) {
     if (!confirm('确定删除？')) return;
     const email = accounts[index].email;
+    // 先尝试停止
     fetch('/grab/' + encodeURIComponent(email) + '/stop', { method: 'POST' }).catch(() => {});
     accounts.splice(index, 1);
     saveAccounts();
