@@ -1,7 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ... (Durable Object 部分不变)
+// Durable Object 部分（不变）
+export class GrabberDO extends DurableObject {
+  // ... (保持你上一个版本的完整 DO 代码)
+  // 为了简洁，这里省略，实际用你已有的完整 DO
+}
 
+// 主 Worker 和 HTML
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -228,32 +233,25 @@ const HTML = `<!DOCTYPE html>
 
   async function checkToken(email) {
     const acc = accounts.find(a => a.email === email);
-    if (!acc) return;
+    if (!acc) return alert('账号不存在');
 
-    const btns = document.querySelectorAll('button');
-    for (let btn of btns) {
-      if (btn.onclick && btn.onclick.toString().includes('checkToken')) btn.disabled = true;
-    }
+    const btn = event.target;
+    if (btn) btn.disabled = true;
 
     try {
-      // 用 getOrderPage 轻量检查 token 是否有效
-      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=1&status=1&phone=', {
-        headers: { token: acc.token }
-      });
-      const json = await res.json();
+      const res = await fetch('/grab/' + encodeURIComponent(email) + '/status');
+      const data = await res.json();
 
-      if (json.code === 200) {
+      if (data.isRunning || data.isPaused || data.lastPhone) {
         alert('✅ Token 有效');
       } else {
-        alert('❌ Token 已失效，请重新登录');
+        alert('❌ Token 可能已失效，请重新登录');
       }
     } catch (e) {
       alert('检查失败: ' + e.message);
     }
 
-    for (let btn of btns) {
-      if (btn.onclick && btn.onclick.toString().includes('checkToken')) btn.disabled = false;
-    }
+    if (btn) btn.disabled = false;
   }
 
   async function loadCaptcha() {
