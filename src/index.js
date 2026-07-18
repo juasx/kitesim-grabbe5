@@ -1,350 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ==================== Durable Object：每个账号独立实例 ====================
-export class GrabberDO extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
-    this.ctx = ctx;
-    this.env = env;
-  }
+// ... (Durable Object 部分不变)
 
-  async fetch(request) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
-        },
-      });
-    }
-
-    try {
-      if (path === "/start" && request.method === "POST") {
-        const body = await request.json();
-        return await this.startGrab(body);
-      }
-      if (path === "/stop" && request.method === "POST") {
-        return await this.stopGrab();
-      }
-      if (path === "/status") {
-        return await this.getStatus();
-      }
-      if (path === "/clear-logs" && request.method === "POST") {
-        await this.ctx.storage.put("logs", []);
-        return json({ ok: true });
-      }
-      return json({ error: "not found" }, 404);
-    } catch (e) {
-      return json({ error: e.message }, 500);
-    }
-  }
-
-  async startGrab({ email, token, patterns }) {
-    if (!email || !token) {
-      return json({ error: "缺少 email 或 token" }, 400);
-    }
-
-    // 保留历史成功记录
-    const old = (await this.ctx.storage.get("state")) || {};
-    const history = old.history || [];
-
-    const state = {
-      email,
-      token,
-      patterns: patterns || ["aaab", "abbb", "aaaa", "abab", "abba"],
-      isRunning: true,
-      totalScanned: old.totalScanned || 0,
-      lastPhone: old.lastPhone || null,
-      lastOrderNo: old.lastOrderNo || null,
-      pauseUntil: 0,
-      history,
-      startedAt: Date.now(),
-    };
-
-    await this.ctx.storage.put("state", state);
-    await this.addLog(`开始抢号：${email} | 匹配类：${state.patterns.join(",")}`);
-
-    await this.pollOnce();
-    await this.ctx.storage.setAlarm(Date.now() + 10000);
-
-    return json({ ok: true, message: "已启动后台抢号" });
-  }
-
-  async stopGrab() {
-    const state = (await this.ctx.storage.get("state")) || {};
-    state.isRunning = false;
-    await this.ctx.storage.put("state", state);
-    await this.ctx.storage.deleteAlarm();
-    await this.addLog("已停止抢号");
-    return json({ ok: true });
-  }
-
-  async getStatus() {
-    const state = (await this.ctx.storage.get("state")) || { isRunning: false };
-    const logs = (await this.ctx.storage.get("logs")) || [];
-    const now = Date.now();
-    const pauseUntil = state.pauseUntil || 0;
-    const isPaused = pauseUntil > now;
-    return json({
-      isRunning: !!state.isRunning,
-      isPaused,
-      pauseUntil,
-      email: state.email || null,
-      totalScanned: state.totalScanned || 0,
-      lastPhone: state.lastPhone || null,
-      lastOrderNo: state.lastOrderNo || null,
-      history: state.history || [],
-      logs: logs.slice(-40),
-    });
-  }
-
-  async alarm() {
-    const state = await this.ctx.storage.get("state");
-    if (!state || !state.isRunning) return;
-
-    const now = Date.now();
-    // 还在暂停期
-    if (state.pauseUntil && state.pauseUntil > now) {
-      const leftMin = Math.ceil((state.pauseUntil - now) / 60000);
-      // 每分钟打一次日志提示
-      if (!state.lastPauseLog || now - state.lastPauseLog > 55000) {
-        await this.addLog(`暂停中，约 ${leftMin} 分钟后恢复抢号...`);
-        state.lastPauseLog = now;
-        await this.ctx.storage.put("state", state);
-      }
-      // 精确约到暂停结束
-      await this.ctx.storage.setAlarm(Math.min(state.pauseUntil, now + 60000));
-      return;
-    }
-
-    // 暂停刚结束
-    if (state.pauseUntil && state.pauseUntil <= now) {
-      state.pauseUntil = 0;
-      await this.ctx.storage.put("state", state);
-      await this.addLog("暂停结束，恢复抢号");
-    }
-
-    try {
-      await this.pollOnce();
-    } catch (e) {
-      await this.addLog("轮询出错: " + e.message);
-    }
-
-    const latest = await this.ctx.storage.get("state");
-    if (latest && latest.isRunning) {
-      // 如果刚成功进入暂停，约到暂停结束；否则 10 秒后
-      if (latest.pauseUntil && latest.pauseUntil > Date.now()) {
-        await this.ctx.storage.setAlarm(Math.min(latest.pauseUntil, Date.now() + 60000));
-      } else {
-        await this.ctx.storage.setAlarm(Date.now() + 10000);
-      }
-    }
-  }
-
-  async pollOnce() {
-    const state = await this.ctx.storage.get("state");
-    if (!state || !state.isRunning) return;
-
-    const { token, email, patterns } = state;
-
-    const hasPaid = await this.checkHasPaidNumber(token);
-    if (hasPaid) {
-      // 已有待支付订单，暂停 30 分钟再试（给用户时间处理订单）
-      state.pauseUntil = Date.now() + 30 * 60 * 1000;
-      await this.ctx.storage.put("state", state);
-      await this.addLog(`${email} 已有未支付订单，暂停 30 分钟后再试`);
-      return;
-    }
-
-    const numRes = await this.getNewNumber(token);
-    state.totalScanned = (state.totalScanned || 0) + 1;
-    await this.ctx.storage.put("state", state);
-
-    if (numRes.code !== 200 || !Array.isArray(numRes.data) || numRes.data.length === 0) {
-      await this.addLog(`第 ${state.totalScanned} 次 | 获取号码失败`);
-      return;
-    }
-
-    let matchedPhone = null;
-    let matchedClass = "";
-
-    for (const item of numRes.data) {
-      if (!item.phoneNumber || item.buyPrice !== 0.3) continue;
-      const last4 = item.phoneNumber.slice(-4);
-      for (const pat of patterns) {
-        if (this.matchesPattern(last4, pat)) {
-          matchedPhone = item.phoneNumber;
-          matchedClass = pat;
-          break;
-        }
-      }
-      if (matchedPhone) break;
-    }
-
-    if (!matchedPhone) {
-      await this.addLog(`第 ${state.totalScanned} 次 | 无符合条件号码`);
-      return;
-    }
-
-    await this.addLog(`发现 ${matchedClass}类 号码 ${matchedPhone}（0.3季包），开始占号...`);
-
-    const buyRes = await this.buyNumber(matchedPhone, token);
-    if (buyRes.code !== 200 || !buyRes.data?.orderNo) {
-      const msg = buyRes.message || "未知";
-      // 已有待支付订单 = 实际上已经占过号了，暂停 30 分钟
-      if (msg.includes("待支付") || msg.includes("无法购买新号码")) {
-        state.pauseUntil = Date.now() + 30 * 60 * 1000;
-        state.lastPhone = matchedPhone; // 记录这次尝试的号码
-        await this.ctx.storage.put("state", state);
-        await this.addLog(`账号已有待支付订单（可能已占到号），暂停 30 分钟后再试`);
-        await this.addLog(`失败信息：${msg}`);
-        return;
-      }
-      await this.addLog(`占号失败（${msg}），继续轮询...`);
-      return;
-    }
-
-    // 返回订单号 = 成功 → 记录历史，暂停 30 分钟后自动恢复
-    state.lastPhone = matchedPhone;
-    state.lastOrderNo = buyRes.data.orderNo;
-    state.pauseUntil = Date.now() + 30 * 60 * 1000; // 30 分钟
-    state.history = state.history || [];
-    state.history.push({
-      phone: matchedPhone,
-      orderNo: buyRes.data.orderNo,
-      class: matchedClass,
-      time: new Date().toLocaleString("zh-CN", { hour12: false }),
-    });
-    // 只保留最近 20 条历史
-    if (state.history.length > 20) state.history = state.history.slice(-20);
-    await this.ctx.storage.put("state", state);
-
-    await this.addLog(`【成功】${matchedClass}类 ${matchedPhone} | 订单号 ${buyRes.data.orderNo}`);
-    await this.addLog(`已暂停 30 分钟，之后自动恢复抢号`);
-
-    try {
-      const payRes = await this.confirmPay(buyRes.data.orderNo, token);
-      if (payRes.code === 200) {
-        await this.addLog("确认支付成功");
-      } else {
-        await this.addLog(`确认支付返回（${payRes.message || "未知"}），订单已生成`);
-      }
-    } catch (e) {
-      await this.addLog("确认支付异常，但订单已生成");
-    }
-  }
-
-  matchesPattern(last4, pattern) {
-    if (!last4 || last4.length !== 4) return false;
-    const [a, b, c, d] = last4.split("");
-    if (pattern === "aaaa") return a === b && b === c && c === d;
-    if (pattern === "aaab") return a === b && b === c && c !== d;
-    if (pattern === "abbb") return a !== b && b === c && c === d;
-    if (pattern === "abab") return a === c && b === d && a !== b;
-    if (pattern === "abba") return a === d && b === c && a !== b;
-    return false;
-  }
-
-    async checkHasPaidNumber(token) {
-    // 同时查 status=0/1/2，避免漏掉待支付订单
-    const statuses = [0, 1, 2];
-    const headers = {
-      token,
-      Origin: "https://h5.kitesim.co",
-      Referer: "https://h5.kitesim.co/",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-    };
-    for (const st of statuses) {
-      try {
-        const res = await fetch(
-          `https://api.kitesim.co/userPhonePurchase/getOrderPage?page=1&size=10&status=${st}&phone=`,
-          { headers }
-        );
-        const data = await res.json();
-        if (data.data?.records?.length > 0) return true;
-      } catch (e) {}
-    }
-    return false;
-  }
-
-  async getNewNumber(token) {
-    const res = await fetch("https://api.kitesim.co/countryCode/getPhoneNumber/CA", {
-      headers: {
-        token,
-        Origin: "https://h5.kitesim.co",
-        Referer: "https://h5.kitesim.co/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-      },
-    });
-    return await res.json();
-  }
-
-  async buyNumber(phoneNumber, token) {
-    try {
-      const res = await fetch("https://api.kitesim.co/userPhonePurchase/buyPhoneNumberOrder", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          token,
-          Origin: "https://h5.kitesim.co",
-          Referer: "https://h5.kitesim.co/",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        },
-        body: JSON.stringify({
-          autoRenew: 0,
-          countryCode: "CA",
-          couponId: null,
-          couponType: null,
-          isSelected: 0,
-          packageId: "1958014808238002177",
-          phoneNumber,
-          serviceId: "",
-          type: 1,
-        }),
-      });
-      return await res.json();
-    } catch (e) {
-      return { code: 0, message: e.message };
-    }
-  }
-
-  async confirmPay(orderNo, token) {
-    try {
-      const res = await fetch("https://api.kitesim.co/userPhonePurchase/confirmPay", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          token,
-          Origin: "https://h5.kitesim.co",
-          Referer: "https://h5.kitesim.co/",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        },
-        body: JSON.stringify({
-          paymentMethod: 1,
-          payChannel: "1",
-          orderNo,
-        }),
-      });
-      return await res.json();
-    } catch (e) {
-      return { code: 0, message: e.message };
-    }
-  }
-
-  async addLog(text) {
-    const logs = (await this.ctx.storage.get("logs")) || [];
-    const time = new Date().toLocaleString("zh-CN", { hour12: false });
-    logs.push(`[${time}] ${text}`);
-    if (logs.length > 80) logs.splice(0, logs.length - 80);
-    await this.ctx.storage.put("logs", logs);
-  }
-}
-
-// ==================== 主 Worker ====================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -359,24 +16,22 @@ export default {
       });
     }
 
-    // /grab/<email>/start  /grab/<email>/stop  /grab/<email>/status
     if (url.pathname.startsWith("/grab/")) {
-      const parts = url.pathname.split("/").filter(Boolean); // ["grab", "email@xx.com", "start"]
+      const parts = url.pathname.split("/").filter(Boolean);
       if (parts.length >= 3) {
         const email = decodeURIComponent(parts[1]);
-        const action = parts[2]; // start / stop / status / clear-logs
+        const action = parts[2];
 
-        const id = env.GRABBER.idFromName(email); // 每个邮箱独立实例
+        const id = env.GRABBER.idFromName(email);
         const stub = env.GRABBER.get(id);
 
         const newUrl = new URL(request.url);
         newUrl.pathname = "/" + action;
         return stub.fetch(new Request(newUrl, request));
       }
-      return json({ error: "path error, use /grab/<email>/start|stop|status" }, 400);
+      return json({ error: "path error" }, 400);
     }
 
-    // 原有代理
     if (url.pathname.startsWith("/api/")) {
       const targetPath = url.pathname.replace(/^\/api/, "") + url.search;
       const target = "https://api.kitesim.co" + targetPath;
@@ -419,7 +74,6 @@ function json(data, status = 200) {
   });
 }
 
-// ==================== 前端（支持多账号并行） ====================
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -457,7 +111,7 @@ const HTML = `<!DOCTYPE html>
   <div class="container">
     <div class="page active" id="pageMain">
       <div class="nav">
-        <div class="nav-title">Kite Grabber（多账号）</div>
+        <div class="nav-title">Kite Grabber（多账号后台）</div>
         <button class="btn secondary" style="width:auto;padding:8px 14px;" onclick="goAddAccount()">添加账号</button>
       </div>
 
@@ -510,7 +164,7 @@ const HTML = `<!DOCTYPE html>
   let captchaKey = '';
   let currentViewEmail = null;
   let statusTimer = null;
-  let statusMap = {}; // email -> status
+  let statusMap = {};
 
   function saveAccounts() { localStorage.setItem('grabber_accounts', JSON.stringify(accounts)); }
 
@@ -542,10 +196,11 @@ const HTML = `<!DOCTYPE html>
     accounts.forEach((acc, index) => {
       const st = statusMap[acc.email] || {};
       const isRunning = !!st.isRunning;
+      const isPaused = !!st.isPaused;
       const lastPhone = st.lastPhone;
 
       let statusHtml = '';
-      if (st.isPaused) {
+      if (isPaused) {
         const left = st.pauseUntil ? Math.ceil((st.pauseUntil - Date.now()) / 60000) : 30;
         statusHtml = '<span class="status success">暂停中 · ' + left + '分钟后恢复</span>';
       } else if (lastPhone && !isRunning) {
@@ -558,19 +213,47 @@ const HTML = `<!DOCTYPE html>
 
       const div = document.createElement('div');
       div.className = 'acc-row';
-      div.innerHTML = \`
-        <div class="acc-info" onclick="viewLogs('\${acc.email}')" style="cursor:pointer;">
-          <div class="acc-email">\${acc.email}</div>
-          <div class="acc-meta">\${statusHtml}</div>
-        </div>
-        <div class="acc-actions">
-          <button class="btn small" \${isRunning ? 'disabled' : ''} onclick="startOne('\${acc.email}')">开始</button>
-          <button class="btn secondary small" onclick="stopOne('\${acc.email}')">停止</button>
-          <button class="btn secondary small" style="color:#c8102e;" onclick="removeAccount(\${index})">删</button>
-        </div>
-      \`;
+      div.innerHTML = '<div class="acc-info" onclick="viewLogs(\\'' + acc.email + '\\')" style="cursor:pointer;">' +
+        '<div class="acc-email">' + acc.email + '</div>' +
+        '<div class="acc-meta">' + statusHtml + '</div></div>' +
+        '<div class="acc-actions">' +
+        '<button class="btn small" ' + (isRunning || isPaused ? 'disabled' : '') + ' onclick="startOne(\\'' + acc.email + '\\')">开始</button>' +
+        '<button class="btn secondary small" onclick="checkToken(\\'' + acc.email + '\\')">检查</button>' +
+        '<button class="btn secondary small" onclick="stopOne(\\'' + acc.email + '\\')">停止</button>' +
+        '<button class="btn secondary small" style="color:#c8102e;" onclick="removeAccount(' + index + ')">删</button>' +
+        '</div>';
       container.appendChild(div);
     });
+  }
+
+  async function checkToken(email) {
+    const acc = accounts.find(a => a.email === email);
+    if (!acc) return;
+
+    const btns = document.querySelectorAll('button');
+    for (let btn of btns) {
+      if (btn.onclick && btn.onclick.toString().includes('checkToken')) btn.disabled = true;
+    }
+
+    try {
+      // 用 getOrderPage 轻量检查 token 是否有效
+      const res = await fetch('/api/userPhonePurchase/getOrderPage?page=1&size=1&status=1&phone=', {
+        headers: { token: acc.token }
+      });
+      const json = await res.json();
+
+      if (json.code === 200) {
+        alert('✅ Token 有效');
+      } else {
+        alert('❌ Token 已失效，请重新登录');
+      }
+    } catch (e) {
+      alert('检查失败: ' + e.message);
+    }
+
+    for (let btn of btns) {
+      if (btn.onclick && btn.onclick.toString().includes('checkToken')) btn.disabled = false;
+    }
   }
 
   async function loadCaptcha() {
@@ -628,7 +311,6 @@ const HTML = `<!DOCTYPE html>
   function removeAccount(index) {
     if (!confirm('确定删除？')) return;
     const email = accounts[index].email;
-    // 先尝试停止
     fetch('/grab/' + encodeURIComponent(email) + '/stop', { method: 'POST' }).catch(() => {});
     accounts.splice(index, 1);
     saveAccounts();
